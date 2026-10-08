@@ -2,10 +2,13 @@
 ## DATOS DE LA ESTRUCTURA GENERAL ##
 
 En Requirements.txt fijamos versiones:
-instalación correr
+instalación
+```
 cd agente-resorte
 pip install -r requirements.txt
+```
 
+> Sin internet: `pip download -r requirements.txt -d wheels/` y luego `pip install --no-index --find-links wheels/ -r requirements.txt`.
 
 ## CON RESPECTO A LOS VIDEOS ##
 No suban videos al repo. Pesan mucho. Pónganlos en Google Drive y dejen el link en el README (agrego *.mp4 al .gitignore)
@@ -33,3 +36,16 @@ No suban videos al repo. Pesan mucho. Pónganlos en Google Drive y dejen el link
 Con esto puedo generar diferentes ruidos
 python generador_sintetico.py --semilla 1 --salida sint1.mp4
 python generador_sintetico.py --semilla 2 --salida sint2.mp4
+
+# Main
+Prueba con el sintético:
+python generador_sintetico.py
+python tracking.py sintetico.mp4 --ver
+
+Con videos reales:
+python main.py videos/*.mp4 --masa 0.250 --masa-resorte 0.030 --regla-m 0.30 --fps-real 29.97 \
+  --eje y --masas-estaticas 0.1 0.2 0.3 0.4 --elongaciones 0.082 0.165 0.249 0.330
+
+>Si la detección falla o se pega a otras cosas, los rangos HSV de COLORES son el primer lugar a ajustar. Con --ver ves enseguida si engancha el objeto correcto.
+Los colores saturados (rojo, verde, azul) funcionan mejor que el negro o el blanco. Pinten o pongan una marca de color fuerte sobre la masa.
+Si hay otros objetos del mismo color en la imagen (ropa, carteles), el filtro del contorno más grande puede engancharse al equivocado. Cuiden el fondo.
