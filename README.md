@@ -15,7 +15,7 @@ pip install -r requirements.txt
 Desde la carpeta `agente-resorte`, instalá las dependencias y arrancá la interfaz:
 ```
 pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 En la página podés subir una o varias repeticiones, ingresar las masas y elegir el eje y
