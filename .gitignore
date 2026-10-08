@@ -220,4 +220,11 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Videos
+.venv/
+__pycache__/
 *.mp4
+*.avi
+*.mov
+.env
+datos/
+salidas/
