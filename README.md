@@ -28,3 +28,8 @@ Orden: 3 es un buen punto de partida.
 Comparación obligatoria: crudo vs filtrado para x, v y a (ya sale en el gráfico).
 Limitación a anotar: incerteza_cruda asume ruido independiente entre cuadros. Después del filtrado, σv y σa ya no valen así. Para la incerteza final conviene usar el ajuste del paso siguiente (ajuste.py), que es donde sale k con su error.
 No suban videos al repo. Pesan mucho. Pónganlos en Google Drive y dejen el link en el README (agrego *.mp4 al .gitignore)
+
+# Generador Sintético
+Con esto puedo generar diferentes ruidos
+python generador_sintetico.py --semilla 1 --salida sint1.mp4
+python generador_sintetico.py --semilla 2 --salida sint2.mp4
