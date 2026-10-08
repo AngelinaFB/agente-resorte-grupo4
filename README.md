@@ -1,7 +1,7 @@
 # agente-resorte-grupo4
 ## DATOS DE LA ESTRUCTURA GENERAL ##
 
-En Requirements.txt fijamos versiones:
+En `agente-resorte/requirements.txt` están las dependencias:
 instalación
 ```
 cd agente-resorte
@@ -9,6 +9,23 @@ pip install -r requirements.txt
 ```
 
 > Sin internet: `pip download -r requirements.txt -d wheels/` y luego `pip install --no-index --find-links wheels/ -r requirements.txt`.
+
+## INTERFAZ PARA ANALIZAR VIDEOS
+
+Desde la carpeta `agente-resorte`, instalá las dependencias y arrancá la interfaz:
+```
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+En la página podés subir una o varias repeticiones, ingresar las masas y elegir el eje y
+el color de la marca que se sigue. Para la escala espacial, indicá los px/m conocidos con
+su incerteza, o medí una regla visible en el primer video ingresando las coordenadas de
+sus extremos. El FPS real y el chequeo estático son opcionales.
+
+Al terminar, la interfaz muestra los resultados y gráficos, y permite descargar el
+informe, el JSON o un ZIP con todos los archivos generados. Los videos se procesan desde
+una carpeta temporal; no los agregues al repositorio.
 
 ## CON RESPECTO A LOS VIDEOS ##
 No suban videos al repo. Pesan mucho. Pónganlos en Google Drive y dejen el link en el README (agrego *.mp4 al .gitignore)

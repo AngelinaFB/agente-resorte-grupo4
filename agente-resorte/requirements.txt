@@ -4,3 +4,4 @@ opencv-python
 lmfit
 uncertainties
 matplotlib
+streamlit
