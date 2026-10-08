@@ -36,24 +36,38 @@ def escala_px_por_m(p1, p2, largo_m, sigma_punto_px=1.0, sigma_largo_m=0.0005):
     return s, sigma_s
 
 
-def fps_real_con_led(video, roi, f_led_hz):
-    """fps real filmando un LED que parpadea a f_led_hz. roi=(x, y, w, h). Devuelve (fps, incerteza)."""
+def fps_real_con_led(video, roi=None, f_led_hz=None):
+    """fps real filmando un LED que parpadea a f_led_hz. Devuelve (fps, incerteza).
+
+    roi=(x, y, w, h) acota la región del LED; roi=None usa el brillo medio de todo
+    el cuadro. La incerteza combina la dispersión de los periodos medidos y el piso
+    de cuantización de los periodos enteros en cuadros (1/√12 cuadro por periodo).
+    """
+    if not f_led_hz:
+        raise RuntimeError("falta la frecuencia del LED (f_led_hz)")
     cap = cv2.VideoCapture(video)
-    x, y, w, h = roi
     brillo = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        brillo.append(frame[y:y + h, x:x + w].mean())
+        brillo.append(frame.mean() if roi is None else
+                      frame[roi[1]:roi[1] + roi[3], roi[0]:roi[0] + roi[2]].mean())
     cap.release()
     b = np.array(brillo)
     picos, _ = find_peaks(b, distance=2, prominence=0.3 * (b.max() - b.min()))
     if len(picos) < 4:
         raise RuntimeError("Muy pocos picos detectados: revisar ROI o frecuencia del LED")
     periodos = np.diff(picos)                      # cuadros entre parpadeos
+    n = len(periodos)
+    if periodos.std(ddof=1) > 1.0:                 # un LED da periodos iguales salvo el cuantizado
+        raise RuntimeError(
+            f"los {n} periodos entre parpadeos no son constantes (desvío {periodos.std(ddof=1):.2f} "
+            f"cuadros): el video no parece un LED parpadeando a {f_led_hz} Hz")
     fps = f_led_hz * periodos.mean()
-    sigma = f_led_hz * periodos.std(ddof=1) / np.sqrt(len(periodos))
+    sigma_disp = f_led_hz * periodos.std(ddof=1) / np.sqrt(n)
+    sigma_cuant = f_led_hz / np.sqrt(12 * n)       # periodos enteros: ±1/√12 cuadro
+    sigma = float(np.hypot(sigma_disp, sigma_cuant))
     return fps, sigma
 
 

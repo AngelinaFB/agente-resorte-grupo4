@@ -49,6 +49,14 @@ def incerteza_cruda(dt, sx):
     return sv, sa
 
 
+def comparar_crudo_filtrado(r):
+    """RMS de (crudo - filtrado) para x, v y a con la ventana vigente: cuánto mueve el
+    filtro a cada magnitud. Devuelve {magnitud con unidad: RMS float}."""
+    def rms(k):
+        return float(np.sqrt(np.mean((np.asarray(r[k + "_c"]) - np.asarray(r[k + "_f"])) ** 2)))
+    return {"RMS x (m)": rms("x"), "RMS v (m/s)": rms("v"), "RMS a (m/s²)": rms("a")}
+
+
 def graficar(t, r, salida="salidas/señal.png"):
     import os
     os.makedirs(os.path.dirname(salida), exist_ok=True)

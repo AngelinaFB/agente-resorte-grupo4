@@ -51,6 +51,12 @@ Argumentos de incerteza:
 - `--sigma-g`: incerteza de g para el k estático, en m/s² (default 0.01).
 - `--sigma-elongacion`: incerteza de cada elongación para el k estático, en m (un valor o uno por punto); si no se da, el informe lo anota en limitaciones.
 
+fps real medido con LED:
+- `--video-led RUTA`: video corto de un LED que parpadea, filmado con el mismo setup que los videos del experimento; mide los fps reales y los usa en lugar de `--fps-real` (si se dan los dos, gana el LED).
+- `--f-led HZ`: frecuencia conocida del parpadeo del LED en Hz (obligatorio junto con `--video-led`).
+- `--roi X Y W H`: región del LED en el cuadro en píxeles; si no se da, se usa el brillo de todo el cuadro.
+- La incerteza del fps medida con el LED se propaga a T, γ y k, y el informe indica qué fps se usó, de dónde salió y con qué error.
+
 >Si la detección falla o se pega a otras cosas, los rangos HSV de COLORES son el primer lugar a ajustar. Con --ver ves enseguida si engancha el objeto correcto.
 Los colores saturados (rojo, verde, azul) funcionan mejor que el negro o el blanco. Pinten o pongan una marca de color fuerte sobre la masa.
 Si hay otros objetos del mismo color en la imagen (ropa, carteles), el filtro del contorno más grande puede engancharse al equivocado. Cuiden el fondo.

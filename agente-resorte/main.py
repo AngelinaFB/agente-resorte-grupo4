@@ -8,8 +8,8 @@ import cv2
 from uncertainties import ufloat
 
 from tracking import trackear
-from calibracion import marcar_dos_puntos, escala_px_por_m, a_metros
-from señal import rellenar_nan, procesar, graficar as graficar_senal
+from calibracion import marcar_dos_puntos, escala_px_por_m, a_metros, fps_real_con_led
+from señal import rellenar_nan, procesar, graficar as graficar_senal, comparar_crudo_filtrado
 from ajuste import (ajustar, parametros_con_incerteza, cantidades, k_estatico,
                     chequeo_periodo, energias, maximos, graficar as graficar_ajuste)
 
@@ -32,7 +32,16 @@ def analizar(video, a, escala, carpeta):
     cap = cv2.VideoCapture(video)
     fps_decl = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    fps_uso = a.fps_real if a.fps_real else fps_decl
+    # FPS de uso: medido con LED > --fps-real > declarado por el video
+    if getattr(a, "fps_led", None):
+        fps_uso, fps_sigma = a.fps_led, a.fps_sigma
+        origen = f"medido con LED ({a.f_led} Hz)"
+    elif a.fps_real:
+        fps_uso, fps_sigma = a.fps_real, 0.0
+        origen = "--fps-real (valor informado a mano)"
+    else:
+        fps_uso, fps_sigma = fps_decl, 0.0
+        origen = "declarado por el video (sin verificar)"
 
     t, xm, ym, sxm, sym = a_metros(px_csv, m_csv, escala[0], escala[1])
     t = t * fps_decl / fps_uso                      # corrección por fps real
@@ -47,6 +56,12 @@ def analizar(video, a, escala, carpeta):
     if res.covar is None:
         raise RuntimeError("el ajuste no tiene matriz de covarianza (¿no se detecta oscilación?)")
     p = parametros_con_incerteza(res)
+    if fps_sigma:
+        # los tiempos son t = n/fps: un error relativo del fps escala todos los tiempos,
+        # por lo tanto T y γ (y k, vía ω0²) se corrigen por f_usado/f_real
+        corr = ufloat(1.0, fps_sigma / fps_uso)
+        p["omega"] = p["omega"] * corr
+        p["gamma"] = p["gamma"] * corr
     c = cantidades(p, m, m_r)
 
     r = procesar(t, x, ventana=a.ventana)
@@ -59,12 +74,15 @@ def analizar(video, a, escala, carpeta):
     graficar_ajuste(t, x, res, Ec, Ep, Et, f"{carpeta}/{nombre}_ajuste.png")
 
     T = c["T"]
+    mx = maximos(p)
+    comp = comparar_crudo_filtrado(r)
+    comp["RMS a / a_max del ajuste"] = comp["RMS a (m/s²)"] / mx["a_max (m/s²)"]
     return dict(
         nombre=nombre, T=T, gamma=c["gamma"], k=c["k_con_mef"], k_sin=c["k_sin_mef"],
         A=p["A"], redchi=res.redchi, perdidos=perdidos,
         ciclos=(t[-1] - t[0]) / T.n, muestras_T=T.n * fps_uso,
-        fps_decl=fps_decl, fps_uso=fps_uso,
-        maximos=maximos(p), energia=energia,
+        fps_decl=fps_decl, fps_uso=fps_uso, fps_sigma=fps_sigma, fps_origen=origen,
+        maximos=mx, energia=energia, comp=comp,
     )
 
 
@@ -84,6 +102,16 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
              f"masa del resorte: {fmt(ufloat(a.masa_resorte, a.sigma_masa_resorte), 'kg')}")
     L.append(f"- Escala espacial: {fmt(ufloat(*escala), 'px/m')}")
     L.append(f"- Eje de oscilación: {a.eje} | ventana Savitzky-Golay: {a.ventana}")
+    if res:
+        r0 = res[0]
+        if r0["fps_sigma"]:
+            delta = (r0["fps_uso"] - r0["fps_decl"]) / r0["fps_decl"] if r0["fps_decl"] else 0.0
+            L.append(f"- fps usado: {r0['fps_uso']:.4f} ± {r0['fps_sigma']:.4f} fps | "
+                     f"origen: {r0['fps_origen']} | σ propagada a T, γ y k | "
+                     f"declarado por los videos: {r0['fps_decl']:.4f} fps ({100 * delta:+.1f} %)")
+        else:
+            L.append(f"- fps usado: {r0['fps_uso']:.4f} fps | "
+                     f"origen: {r0['fps_origen']} | sin incerteza estimada")
     L += ["", "## Resultados por video", "",
           "| video | T (s) | γ (1/s) | k con m_ef (N/m) | k sin m_ef (N/m) | χ² red. |",
           "|---|---|---|---|---|---|"]
@@ -111,6 +139,28 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
         for k_, v in res[0]["energia"].items():
             L.append(f"| {k_} | {fmt(v)} |")
 
+        claves = list(res[0]["comp"].keys())
+        L += ["", f"## Crudo vs filtrado (Savitzky-Golay, ventana = {a.ventana} cuadros)", "",
+              "| video | " + " | ".join(claves) + " |",
+              "|---|" + "---|" * len(claves)]
+        prom = {k_: [] for k_ in claves}
+        for r in res:
+            celdas = []
+            for k_ in claves:
+                v = r["comp"][k_]
+                celdas.append(fmt(v) if hasattr(v, "n") else f"{v:.4f}")
+                prom[k_].append(v)
+            L.append(f"| {r['nombre']} | " + " | ".join(celdas) + " |")
+        promedio = []
+        for k_ in claves:
+            vals = prom[k_]
+            media = (sum(vals) / len(vals)) if hasattr(vals[0], "n") else float(np.mean(vals))
+            promedio.append(fmt(media) if hasattr(media, "n") else f"{media:.4f}")
+        L.append("| promedio | " + " | ".join(promedio) + " |")
+        L.append("")
+        L.append("El RMS de a crudo sobre la amplitud de a del ajuste mide cuánto amplifica "
+                 "el ruido la segunda derivada sin filtrar.")
+
     if k_e is not None and T_med is not None:
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -134,8 +184,10 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
             lim.append(f"{r['nombre']}: γ compatible con 0 (amortiguamiento no detectable).")
     if len(res) < 5:
         lim.append(f"Solo {len(res)} repeticiones; la receta pide entre 5 y 20.")
-    if not a.fps_real:
+    if not a.fps_real and not getattr(a, "fps_led", None):
         lim.append("fps real no verificado: se usó el fps declarado por el video.")
+    if getattr(a, "fps_led_aviso", None):
+        lim.append(a.fps_led_aviso + ".")
     if k_e is None:
         lim.append("No se hizo el chequeo del período: falta k estático independiente.")
     elif a.sigma_elongacion is None:
@@ -163,6 +215,10 @@ def main():
                     help="incerteza de la escala (px/m); obligatoria junto con --px-por-m")
     ap.add_argument("--regla-m", type=float, help="largo real de la regla (m); marcar 2 puntos en el 1er video")
     ap.add_argument("--fps-real", type=float, help="fps verificado con LED o cronómetro")
+    ap.add_argument("--video-led", help="video de un LED que parpadea a --f-led Hz (mismo setup que los videos)")
+    ap.add_argument("--f-led", type=float, help="frecuencia conocida del LED (Hz)")
+    ap.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
+                    help="región del LED en el cuadro; si no se da, se usa todo el cuadro")
     ap.add_argument("--eje", choices=["x", "y"], default="x", help="x: horizontal, y: vertical")
     ap.add_argument("--ventana", type=int, default=11)
     ap.add_argument("--masas-estaticas", type=float, nargs="+")
@@ -181,6 +237,34 @@ def main():
         ap.error("falta --sigma-px-por-m: con --px-por-m hay que indicar la incerteza de la "
                  "escala en px/m (p. ej. --sigma-px-por-m 2); sin ella la incerteza de la "
                  "calibración sería 0 y las incertezas de x, y y k quedarían subestimadas")
+    if a.video_led and a.f_led is None:
+        ap.error("--video-led requiere también --f-led HZ")
+    if a.f_led is not None and not a.video_led:
+        ap.error("--f-led requiere también --video-led RUTA")
+
+    # fps medido con LED: tiene prioridad sobre --fps-real
+    a.fps_led, a.fps_sigma = None, 0.0
+    if a.video_led:
+        try:
+            a.fps_led, a.fps_sigma = fps_real_con_led(a.video_led, a.roi, a.f_led)
+        except RuntimeError as e:
+            ap.error(f"--video-led: {e}")
+        print(f"fps real (LED): {a.fps_led:.4f} ± {a.fps_sigma:.4f} fps "
+              f"(f_led = {a.f_led} Hz, {'ROI ' + str(a.roi) if a.roi else 'cuadro completo'})")
+        _cap = cv2.VideoCapture(a.videos[0])
+        _decl = _cap.get(cv2.CAP_PROP_FPS)
+        _cap.release()
+        _dif = abs(a.fps_led - _decl) / _decl if _decl else 0.0
+        a.fps_led_aviso = None
+        if _dif > 0.10:
+            a.fps_led_aviso = (
+                f"fps medido con LED ({a.fps_led:.3f}) difiere en {100 * _dif:.0f}% del declarado por "
+                f"los videos de experimentación ({_decl:.3f}): verificar que el video del LED sea del "
+                f"mismo setup y que --f-led ({a.f_led} Hz) sea la frecuencia real del parpadeo")
+            print("ADVERTENCIA: " + a.fps_led_aviso)
+    else:
+        a.fps_led_aviso = None
+
     os.makedirs(a.salidas, exist_ok=True)
 
     # Escala: una vez, para todos los videos (se asume el mismo setup)

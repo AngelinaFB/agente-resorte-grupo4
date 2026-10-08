@@ -70,13 +70,41 @@ def k_estatico(masas_kg, elong_m, g=9.81, sigma_g=0.01, sigma_elongacion=None):
 
 
 def chequeo_periodo(k_est, m, m_r, T_med):
-    """Chequeo físico: T predicho con y sin masa efectiva vs T medido."""
+    """Chequeo físico: T predicho con y sin masa efectiva vs T medido.
+
+    Veredicto por caso con z = |T_calc - T_med| / sqrt(σ_calc² + σ_med²):
+    z < 2 "coincide", 2 ≤ z < 3 "dudoso", z ≥ 3 "no coincide".
+    """
     T_sin = 2 * np.pi * umath.sqrt(m / k_est)
     T_con = 2 * np.pi * umath.sqrt((m + m_r / 3) / k_est)
-    for nombre, T in (("sin m_ef", T_sin), ("con m_ef", T_con)):
+
+    if m_r.n == 0:
+        print(f"  T sin m_ef = T con m_ef = {T_con:.4f} s (masa del resorte = 0)")
+        print("  Chequeo no informativo: con --masa-resorte 0.0 los dos cálculos son idénticos; "
+              "para distinguirlos hay que pesar el resorte y dar --masa-resorte.")
+        return
+
+    z_v = {}
+    for nombre in ("sin m_ef", "con m_ef"):
+        T = T_sin if nombre == "sin m_ef" else T_con
         dif = T - T_med
+        z = abs(dif.nominal_value) / dif.std_dev
+        veredicto = "coincide" if z < 2 else ("dudoso" if z < 3 else "no coincide")
+        z_v[nombre] = (z, veredicto)
         print(f"  T {nombre}: {T:.4f} s | diferencia con T medido: {dif:.4f} s "
-              f"({abs(dif.nominal_value) / dif.std_dev:.1f} σ)")
+              f"({z:.1f} σ) -> {veredicto}")
+
+    conc = [n for n, (z, v) in z_v.items() if v != "no coincide"]
+    texto = {"sin m_ef": "el cálculo sin m_ef", "con m_ef": "el cálculo con m_ef"}
+    if len(conc) == 2:
+        conclusion = "ambos cálculos (con y sin m_ef)"
+    elif len(conc) == 1:
+        conclusion = texto[conc[0]]
+    else:
+        conclusion = "ninguno de los dos cálculos"
+    print(f"  Veredicto: con m_ef: {z_v['con m_ef'][1]} ({z_v['con m_ef'][0]:.1f}σ) | "
+          f"sin m_ef: {z_v['sin m_ef'][1]} ({z_v['sin m_ef'][0]:.1f}σ)")
+    print(f"  Conclusión: el T medido es compatible con {conclusion}.")
 
 
 def energias(x_f, v_f, k, m_ef, C):
