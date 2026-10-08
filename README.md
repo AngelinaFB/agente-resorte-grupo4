@@ -46,6 +46,11 @@ Con videos reales:
 python main.py videos/*.mp4 --masa 0.250 --masa-resorte 0.030 --regla-m 0.30 --fps-real 29.97 \
   --eje y --masas-estaticas 0.1 0.2 0.3 0.4 --elongaciones 0.082 0.165 0.249 0.330
 
+Argumentos de incerteza:
+- `--sigma-px-por-m`: obligatorio si se usa `--px-por-m` (incerteza de la escala en px/m); sin él main.py aborta.
+- `--sigma-g`: incerteza de g para el k estático, en m/s² (default 0.01).
+- `--sigma-elongacion`: incerteza de cada elongación para el k estático, en m (un valor o uno por punto); si no se da, el informe lo anota en limitaciones.
+
 >Si la detección falla o se pega a otras cosas, los rangos HSV de COLORES son el primer lugar a ajustar. Con --ver ves enseguida si engancha el objeto correcto.
 Los colores saturados (rojo, verde, azul) funcionan mejor que el negro o el blanco. Pinten o pongan una marca de color fuerte sobre la masa.
 Si hay otros objetos del mismo color en la imagen (ropa, carteles), el filtro del contorno más grande puede engancharse al equivocado. Cuiden el fondo.

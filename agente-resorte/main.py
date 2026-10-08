@@ -50,9 +50,11 @@ def analizar(video, a, escala, carpeta):
     c = cantidades(p, m, m_r)
 
     r = procesar(t, x, ventana=a.ventana)
-    C = p["C"].nominal_value
-    Ec, Ep, Et = energias(r["x_f"], r["v_f"], c["k_con_mef"].nominal_value,
-                          c["m_ef"].nominal_value, C)
+    Ec, Ep, Et = energias(r["x_f"], r["v_f"], c["k_con_mef"], c["m_ef"], p["C"])
+    i_max = lambda arr: max(arr, key=lambda z: z.n)
+    energia = {"Ec_max (J)": i_max(Ec), "Ep_max (J)": i_max(Ep),
+               "Et media (J)": np.mean(Et), "Et al inicio (J)": Et[0],
+               "Et al final (J)": Et[-1], "ΔEt (final - inicial) (J)": Et[-1] - Et[0]}
     graficar_senal(t, r, f"{carpeta}/{nombre}_senal.png")
     graficar_ajuste(t, x, res, Ec, Ep, Et, f"{carpeta}/{nombre}_ajuste.png")
 
@@ -62,7 +64,7 @@ def analizar(video, a, escala, carpeta):
         A=p["A"], redchi=res.redchi, perdidos=perdidos,
         ciclos=(t[-1] - t[0]) / T.n, muestras_T=T.n * fps_uso,
         fps_decl=fps_decl, fps_uso=fps_uso,
-        maximos=maximos(t, r["x_f"], r["v_f"], r["a_f"], C),
+        maximos=maximos(p), energia=energia,
     )
 
 
@@ -100,9 +102,14 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
             if clave == "T":
                 T_med = media
 
-        L += ["", "## Máximos (primer video, datos filtrados, x desde el equilibrio)", ""]
+        L += ["", "## Máximos (primer video, valores del ajuste con incerteza, x desde el equilibrio)", ""]
         for k_, v in res[0]["maximos"].items():
-            L.append(f"- {k_.strip()}: {v:.4f}")
+            L.append(f"- {k_}: {fmt(v)}")
+
+        L += ["", "## Energía (primer video, datos filtrados, incerteza propagada)", "",
+              "| cantidad | valor con incerteza |", "|---|---|"]
+        for k_, v in res[0]["energia"].items():
+            L.append(f"| {k_} | {fmt(v)} |")
 
     if k_e is not None and T_med is not None:
         buf = io.StringIO()
@@ -131,6 +138,9 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
         lim.append("fps real no verificado: se usó el fps declarado por el video.")
     if k_e is None:
         lim.append("No se hizo el chequeo del período: falta k estático independiente.")
+    elif a.sigma_elongacion is None:
+        lim.append("k estático sin --sigma-elongacion: la incerteza de k no incluye la de las "
+                   "elongaciones medidas (sólo la dispersión de la recta y σg).")
     for nombre, err in fallidos:
         lim.append(f"{nombre}: falló el análisis ({err}).")
     L += ["", "## Limitaciones detectadas automáticamente", ""] + [f"- {x}" for x in lim]
@@ -149,19 +159,28 @@ def main():
     ap.add_argument("--masa-resorte", type=float, default=0.0)
     ap.add_argument("--sigma-masa-resorte", type=float, default=0.0001)
     ap.add_argument("--px-por-m", type=float, help="escala conocida (px/m)")
-    ap.add_argument("--sigma-px-por-m", type=float, default=0.0)
+    ap.add_argument("--sigma-px-por-m", type=float,
+                    help="incerteza de la escala (px/m); obligatoria junto con --px-por-m")
     ap.add_argument("--regla-m", type=float, help="largo real de la regla (m); marcar 2 puntos en el 1er video")
     ap.add_argument("--fps-real", type=float, help="fps verificado con LED o cronómetro")
     ap.add_argument("--eje", choices=["x", "y"], default="x", help="x: horizontal, y: vertical")
     ap.add_argument("--ventana", type=int, default=11)
     ap.add_argument("--masas-estaticas", type=float, nargs="+")
     ap.add_argument("--elongaciones", type=float, nargs="+")
+    ap.add_argument("--sigma-elongacion", type=float,
+                    help="incerteza de cada elongación (m); si no se da, se anota en limitaciones")
+    ap.add_argument("--sigma-g", type=float, default=0.01,
+                    help="incerteza de g en el k estático (m/s², default 0.01)")
     ap.add_argument("--salidas", default="salidas")
     ap.add_argument("--color", choices=["rojo", "naranja", "amarillo", "verde", "azul", "negro"], default="rojo")
     a = ap.parse_args()
 
     if a.px_por_m is None and a.regla_m is None:
         ap.error("dar --px-por-m o --regla-m")
+    if a.px_por_m is not None and a.sigma_px_por_m is None:
+        ap.error("falta --sigma-px-por-m: con --px-por-m hay que indicar la incerteza de la "
+                 "escala en px/m (p. ej. --sigma-px-por-m 2); sin ella la incerteza de la "
+                 "calibración sería 0 y las incertezas de x, y y k quedarían subestimadas")
     os.makedirs(a.salidas, exist_ok=True)
 
     # Escala: una vez, para todos los videos (se asume el mismo setup)
@@ -175,7 +194,8 @@ def main():
     if a.masas_estaticas and a.elongaciones:
         if len(a.masas_estaticas) != len(a.elongaciones) or len(a.masas_estaticas) < 3:
             ap.error("--masas-estaticas y --elongaciones: misma cantidad, mínimo 3")
-        k_e = k_estatico(a.masas_estaticas, a.elongaciones)
+        k_e = k_estatico(a.masas_estaticas, a.elongaciones,
+                         sigma_g=a.sigma_g, sigma_elongacion=a.sigma_elongacion)
 
     res, fallidos = [], []
     for v in a.videos:
