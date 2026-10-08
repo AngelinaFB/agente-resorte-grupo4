@@ -56,6 +56,7 @@ def analizar(video, a, escala, carpeta):
     if res.covar is None:
         raise RuntimeError("el ajuste no tiene matriz de covarianza (¿no se detecta oscilación?)")
     p = parametros_con_incerteza(res)
+    corr = None
     if fps_sigma:
         # los tiempos son t = n/fps: un error relativo del fps escala todos los tiempos,
         # por lo tanto T y γ (y k, vía ω0²) se corrigen por f_usado/f_real
@@ -65,7 +66,9 @@ def analizar(video, a, escala, carpeta):
     c = cantidades(p, m, m_r)
 
     r = procesar(t, x, ventana=a.ventana)
-    Ec, Ep, Et = energias(r["x_f"], r["v_f"], c["k_con_mef"], c["m_ef"], p["C"])
+    # corr es el mismo objeto que escaló ω y γ: así Ec/Et y Ep/k comparten la
+    # incerteza del fps y no se cuenta dos veces en Et ni en RMS a / a_max
+    Ec, Ep, Et = energias(r["x_f"], r["v_f"], c["k_con_mef"], c["m_ef"], p["C"], corr_v=corr)
     i_max = lambda arr: max(arr, key=lambda z: z.n)
     energia = {"Ec_max (J)": i_max(Ec), "Ep_max (J)": i_max(Ep),
                "Et media (J)": np.mean(Et), "Et al inicio (J)": Et[0],
@@ -75,7 +78,7 @@ def analizar(video, a, escala, carpeta):
 
     T = c["T"]
     mx = maximos(p)
-    comp = comparar_crudo_filtrado(r)
+    comp = comparar_crudo_filtrado(r, corr_v=corr)
     comp["RMS a / a_max del ajuste"] = comp["RMS a (m/s²)"] / mx["a_max (m/s²)"]
     return dict(
         nombre=nombre, T=T, gamma=c["gamma"], k=c["k_con_mef"], k_sin=c["k_sin_mef"],
@@ -109,6 +112,10 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
             L.append(f"- fps usado: {r0['fps_uso']:.4f} ± {r0['fps_sigma']:.4f} fps | "
                      f"origen: {r0['fps_origen']} | σ propagada a T, γ y k | "
                      f"declarado por los videos: {r0['fps_decl']:.4f} fps ({100 * delta:+.1f} %)")
+            L.append("- σ_fps incluida también en Ec_max y Et (v y a por diferencias finitas: v·corr, "
+                     "a·corr²) y en RMS v / RMS a del cuadro crudo vs filtrado; Ep, v_max, a_max y los "
+                     "t de los máximos ya la traían vía k y ω, y la misma variable corr evita "
+                     "duplicarla en Et y en RMS a / a_max.")
         else:
             L.append(f"- fps usado: {r0['fps_uso']:.4f} fps | "
                      f"origen: {r0['fps_origen']} | sin incerteza estimada")

@@ -49,12 +49,21 @@ def incerteza_cruda(dt, sx):
     return sv, sa
 
 
-def comparar_crudo_filtrado(r):
+def comparar_crudo_filtrado(r, corr_v=None):
     """RMS de (crudo - filtrado) para x, v y a con la ventana vigente: cuánto mueve el
-    filtro a cada magnitud. Devuelve {magnitud con unidad: RMS float}."""
+    filtro a cada magnitud. Devuelve {magnitud con unidad: float o ufloat}.
+
+    corr_v: ufloat(1, σ_fps/fps), si se conoce la incerteza del fps. v = Δx/Δt ∝ fps y
+    a ∝ fps², así que se escalan por corr_v y corr_v²; x no depende del fps. None = sin
+    σ_fps (valores planos, como antes).
+    """
     def rms(k):
         return float(np.sqrt(np.mean((np.asarray(r[k + "_c"]) - np.asarray(r[k + "_f"])) ** 2)))
-    return {"RMS x (m)": rms("x"), "RMS v (m/s)": rms("v"), "RMS a (m/s²)": rms("a")}
+    out = {"RMS x (m)": rms("x"), "RMS v (m/s)": rms("v"), "RMS a (m/s²)": rms("a")}
+    if corr_v is not None:
+        out["RMS v (m/s)"] = out["RMS v (m/s)"] * corr_v
+        out["RMS a (m/s²)"] = out["RMS a (m/s²)"] * corr_v ** 2
+    return out
 
 
 def graficar(t, r, salida="salidas/señal.png"):

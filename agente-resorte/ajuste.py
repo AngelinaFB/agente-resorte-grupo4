@@ -107,12 +107,17 @@ def chequeo_periodo(k_est, m, m_r, T_med):
     print(f"  Conclusión: el T medido es compatible con {conclusion}.")
 
 
-def energias(x_f, v_f, k, m_ef, C):
+def energias(x_f, v_f, k, m_ef, C, corr_v=None):
     """Ec = ½ m_ef v², Ep = ½ k (x-C)². x medido desde el equilibrio C.
 
     k, m_ef y C pueden ser ufloat: la incerteza se propaga a Ec, Ep y Et, que quedan
     como arreglos de objetos (para graficar usar los valores nominales, ver graficar()).
+    corr_v: ufloat(1, σ_fps/fps), si se conoce la incerteza del fps. v = Δx/Δt ∝ fps,
+    así que v se escala por corr_v y Ec arranca con ese factor (correlacionado con el
+    mismo corr que ya llevan ω y γ, y por ende k: Ep no se duplica). None = sin σ_fps.
     """
+    if corr_v is not None:
+        v_f = v_f * corr_v
     Ec = 0.5 * m_ef * v_f**2
     Ep = 0.5 * k * (x_f - C) ** 2
     return Ec, Ep, Ec + Ep
