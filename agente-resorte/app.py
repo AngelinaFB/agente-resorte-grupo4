@@ -10,7 +10,7 @@ import numpy as np
 import streamlit as st
 
 from calibracion import escala_px_por_m
-from main import analizar, escribir_informe
+from main import analizar, escribir_informe, resultados_json, variables_comunes
 from tracking import COLORES
 from ajuste import k_estatico
 
@@ -189,6 +189,7 @@ if ejecutar:
                 elongaciones=elongaciones,
                 fps_led_aviso=None,
             )
+            args.masa_u, args.masa_resorte_u, args.corr_fps = variables_comunes(args)
             k_e = (
                 k_estatico(
                     masas_estaticas,
@@ -224,17 +225,7 @@ if ejecutar:
                     escribir_informe(resultados, fallidos, args, escala, k_e, str(informe_path))
                     json_path = salidas_dir / "resultados.json"
                     json_path.write_text(
-                        json.dumps(
-                            [
-                                {
-                                    clave: (resultado[clave].n, resultado[clave].s)
-                                    for clave in ("T", "gamma", "k", "k_sin")
-                                }
-                                | {"video": resultado["nombre"]}
-                                for resultado in resultados
-                            ],
-                            indent=2,
-                        ),
+                        json.dumps(resultados_json(resultados), indent=2),
                         encoding="utf-8",
                     )
                     archivos = {
