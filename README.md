@@ -75,6 +75,7 @@ fps real medido con LED:
 - La incerteza del fps medida con el LED se propaga a T, γ y k, y el informe indica qué fps se usó, de dónde salió y con qué error.
 - El resultado agregado separa σ_est (dispersión entre videos/√N) de σ_sis (fps, masa y masa del resorte comunes, sin dividir por √N); `resultados.json` agrega `<variable>_est`, `<variable>_sis` y `<variable>_tot` sin cambiar las claves existentes.
 
+>Si hay varias marcas del mismo color, `trackear()` sigue por continuidad la más cercana al cuadro anterior y descarta los saltos mayores al umbral adaptativo (`SALTO_*`), informando por `print` y en `trackear.ultimo_resumen` los cuadros descartados y los que tuvieron más de un candidato.
 >Si la detección falla o se pega a otras cosas, los rangos HSV de COLORES son el primer lugar a ajustar. Con --ver ves enseguida si engancha el objeto correcto.
 Los colores saturados (rojo, verde, azul) funcionan mejor que el negro o el blanco. Pinten o pongan una marca de color fuerte sobre la masa.
 Si hay otros objetos del mismo color en la imagen (ropa, carteles), el filtro del contorno más grande puede engancharse al equivocado. Cuiden el fondo.

@@ -1,6 +1,7 @@
 """Tracking por color con OpenCV: video -> tabla (t, x, y, σx, σy) en píxeles.
 Offline, sin dependencias extra."""
 import argparse, csv
+from collections import deque
 import cv2
 import numpy as np
 
@@ -16,6 +17,52 @@ COLORES = {
 
 SIGMA_PX = 0.29      # 1/√12 px: incerteza por discretización (conservadora para centroide subpíxel)
 AREA_MIN = 30        # px²: objetos más chicos se descartan como ruido
+
+# Seguimiento por continuidad cuando hay MÁS DE UN contorno candidato (p. ej. dos
+# marcas del mismo color). El umbral de salto máximo es adaptativo: SALTO_FACTOR
+# veces la mediana de los últimos SALTO_N_MEDIANA saltos aceptados, con piso
+# SALTO_MIN_PX (8 px ≈ 4 mm a 2000 px/m). Mientras haya menos de
+# SALTO_MIN_MUESTRAS saltos se usa SALTO_INICIAL_PX (60 px, para ~2000 px/m y
+# 30 fps). Si el
+# candidato más cercano supera el umbral, el cuadro queda en NaN. Con un único
+# contorno candidato NO se aplica el umbral: se conserva el comportamiento previo.
+SALTO_FACTOR = 4.0
+SALTO_MIN_PX = 8.0
+SALTO_INICIAL_PX = 60.0
+SALTO_N_MEDIANA = 15
+SALTO_MIN_MUESTRAS = 5
+
+
+class TablaTracking(np.ndarray):
+    """Array (N, 5) del tracking; el resumen queda en el atributo `.resumen`."""
+
+
+def _contornos_candidatos(frame, color):
+    """Contornos de la máscara de color con área >= AREA_MIN."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    m = np.zeros(hsv.shape[:2], np.uint8)
+    for lo, hi in COLORES[color]:
+        m |= cv2.inRange(hsv, lo, hi)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contornos, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contornos if cv2.contourArea(c) >= AREA_MIN]
+
+
+def _centroide(contorno, forma):
+    """Centroide del contorno relleno (mismo criterio que el de la tabla)."""
+    m = np.zeros(forma, np.uint8)
+    cv2.drawContours(m, [contorno], -1, 255, -1)
+    M = cv2.moments(m, binaryImage=True)
+    if M["m00"] == 0:
+        return None
+    return M["m10"] / M["m00"], M["m01"] / M["m00"]
+
+
+def _umbral_salto(saltos):
+    """Umbral adaptativo en px a partir de los saltos ya aceptados."""
+    if len(saltos) < SALTO_MIN_MUESTRAS:
+        return SALTO_INICIAL_PX
+    return max(SALTO_MIN_PX, SALTO_FACTOR * float(np.median(saltos)))
 
 
 def mascara(frame, color):
@@ -37,7 +84,15 @@ def mascara(frame, color):
 
 
 def trackear(video, salida="tabla.csv", color="rojo", ver=False):
-    """Devuelve array (N, 5): t_s, x_px, y_px, sx_px, sy_px. NaN donde no se detectó."""
+    """Devuelve array (N, 5): t_s, x_px, y_px, sx_px, sy_px. NaN donde no se detectó.
+
+    Con varias marcas del mismo color sigue una sola por continuidad: primer cuadro
+    con detección = mayor área; luego, el candidato cuyo centroide está más cerca
+    del último centroide válido. Si el más cercano supera el umbral de salto (ver
+    constantes SALTO_*), el cuadro queda en NaN. El resumen se imprime y también
+    queda en `trackear.ultimo_resumen` y en el atributo `.resumen` del array
+    devuelto, sin cambiar la firma.
+    """
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
         raise RuntimeError(f"No se pudo abrir el video: {video}")
@@ -46,14 +101,47 @@ def trackear(video, salida="tabla.csv", color="rojo", ver=False):
         raise RuntimeError("El video no informa fps")
 
     filas, i = [], 0
+    previo = None
+    saltos = deque(maxlen=SALTO_N_MEDIANA)
+    descartados = 0
+    multiples = 0
+
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        m = mascara(frame, color)
-        if m is not None:
+        candidatos = _contornos_candidatos(frame, color)
+        forma = frame.shape[:2]
+        elegido = None
+
+        if len(candidatos) > 1:
+            multiples += 1
+            centros = [(_centroide(c, forma), c) for c in candidatos]
+            centros = [(p, c) for p, c in centros if p is not None]
+            if not centros:
+                elegido = None
+            elif previo is None:
+                elegido = max((c for _, c in centros), key=cv2.contourArea)
+            else:
+                distancias = [np.hypot(p[0] - previo[0], p[1] - previo[1])
+                              for p, _ in centros]
+                j = int(np.argmin(distancias))
+                if distancias[j] > _umbral_salto(saltos):
+                    descartados += 1
+                    elegido = None
+                else:
+                    elegido = centros[j][1]
+        elif len(candidatos) == 1:
+            elegido = candidatos[0]
+
+        if elegido is not None:
+            m = np.zeros(forma, np.uint8)
+            cv2.drawContours(m, [elegido], -1, 255, -1)
             M = cv2.moments(m, binaryImage=True)
             x, y = M["m10"] / M["m00"], M["m01"] / M["m00"]
+            if previo is not None:
+                saltos.append(float(np.hypot(x - previo[0], y - previo[1])))
+            previo = (x, y)
             filas.append((i / fps, x, y, SIGMA_PX, SIGMA_PX))
             if ver:
                 cv2.circle(frame, (int(x), int(y)), 6, (0, 255, 0), 2)
@@ -72,7 +160,20 @@ def trackear(video, salida="tabla.csv", color="rojo", ver=False):
         w = csv.writer(f)
         w.writerow(["t_s", "x_px", "y_px", "sx_px", "sy_px"])
         w.writerows(filas)
-    return np.array(filas)
+
+    tabla = np.asarray(filas).view(TablaTracking)
+    resumen = {
+        "cuadros": i,
+        "descartados_por_salto": descartados,
+        "cuadros_con_multiples": multiples,
+        "sin_deteccion": int(np.isnan(tabla[:, 1]).sum()) if tabla.size else 0,
+    }
+    tabla.resumen = resumen
+    trackear.ultimo_resumen = resumen
+    print(f"tracking: {resumen['cuadros']} cuadros | "
+          f"{descartados} descartados por salto | "
+          f"{multiples} con más de un contorno candidato")
+    return tabla
 
 
 if __name__ == "__main__":
