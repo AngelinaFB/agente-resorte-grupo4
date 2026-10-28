@@ -36,7 +36,7 @@ videos = st.file_uploader(
     "Videos del experimento",
     type=["mp4", "avi", "mov", "mkv"],
     accept_multiple_files=True,
-    help="Podés subir varias repeticiones filmadas con la misma configuración.",
+    help="Subí uno o varios videos del mismo setup/cámara. Si subís varias repeticiones se van a agregar automáticamente.",
 )
 
 modo_escala = st.radio(
@@ -63,22 +63,43 @@ if videos and modo_escala == "Medir una regla en el primer video":
             )
             st.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
+st.subheader("Datos del experimento")
+col1, col2 = st.columns(2)
+masa = col1.number_input(
+    "Masa total colgante (kg)",
+    min_value=0.000001,
+    value=0.250,
+    step=0.010,
+    help="Masa total que cuelga del resorte (recipiente/portapesas + pesa añadida). Esta es la m que usa el ajuste y la que entra en m_ef = m + m_r/3.",
+)
+sigma_masa = col2.number_input("Incerteza de la masa (kg)", min_value=0.0, value=0.001, step=0.001)
+masa_resorte = col1.number_input(
+    "Masa del resorte (kg)",
+    min_value=0.0,
+    value=0.030,
+    step=0.001,
+    help="Masa del resorte medida con balanza [kg]. Se suma con factor 1/3 para calcular la masa efectiva.",
+)
+if masa_resorte == 0.0:
+    st.caption("Si la masa del resorte es 0, k_con_m_ef = k_sin_m_ef y el chequeo de masa efectiva pierde sentido.")
+sigma_masa_resorte = col2.number_input(
+    "Incerteza de la masa del resorte (kg)", min_value=0.0, value=0.0001, step=0.0001, format="%.4f"
+)
+st.caption(f"Masa total colgante = {masa*1000.0:.3f} g")
+
 with st.form("parametros_analisis"):
-    st.subheader("Datos del experimento")
-    col1, col2 = st.columns(2)
-    masa = col1.number_input("Masa colgante (kg)", min_value=0.000001, value=0.250, step=0.010)
-    sigma_masa = col2.number_input("Incerteza de la masa (kg)", min_value=0.0, value=0.001, step=0.001)
-    masa_resorte = col1.number_input("Masa del resorte (kg)", min_value=0.0, value=0.030, step=0.001)
-    sigma_masa_resorte = col2.number_input(
-        "Incerteza de la masa del resorte (kg)", min_value=0.0, value=0.0001, step=0.0001, format="%.4f"
-    )
 
     st.subheader("Calibración")
+    st.caption("Recomendado usar el objeto de medida conocido que aparezca en el video (regla, contenedor, etc.) con la opción 'Medir una regla en el primer video'.")
     if modo_escala == "Conozco los píxeles por metro":
         col1, col2 = st.columns(2)
         px_por_m = col1.number_input("Escala (px/m)", min_value=0.000001, value=2000.0, step=10.0)
         sigma_px_por_m = col2.number_input(
-            "Incerteza de la escala (px/m)", min_value=0.0, value=2.0, step=0.5
+            "Incerteza de la escala (px/m)",
+            min_value=0.0,
+            value=2.0,
+            step=0.5,
+            help="Incerteza de la calibración espacial (px/m). Obligatoria si se da px/m.",
         )
         regla_m = None
         puntos = None
@@ -91,16 +112,26 @@ with st.form("parametros_analisis"):
             width, height = frame_size
             st.caption("Ingresá las coordenadas de los extremos sobre la imagen (origen arriba a la izquierda).")
             c1, c2, c3, c4 = st.columns(4)
-            x1 = c1.number_input("x₁ (px)", min_value=0, max_value=width - 1, value=0, key="x1")
-            y1 = c2.number_input("y₁ (px)", min_value=0, max_value=height - 1, value=0, key="y1")
-            x2 = c3.number_input("x₂ (px)", min_value=0, max_value=width - 1, value=width - 1, key="x2")
-            y2 = c4.number_input("y₂ (px)", min_value=0, max_value=height - 1, value=0, key="y2")
+            x1 = c1.number_input("x1 (px)", min_value=0, max_value=width - 1, value=0, key="x1")
+            y1 = c2.number_input("y1 (px)", min_value=0, max_value=height - 1, value=0, key="y1")
+            x2 = c3.number_input("x2 (px)", min_value=0, max_value=width - 1, value=width - 1, key="x2")
+            y2 = c4.number_input("y2 (px)", min_value=0, max_value=height - 1, value=0, key="y2")
             puntos = ((x1, y1), (x2, y2))
 
     col1, col2, col3 = st.columns(3)
-    eje = col1.selectbox("Eje de oscilación", ["y", "x"], format_func=lambda v: "Vertical (y)" if v == "y" else "Horizontal (x)")
-    color = col2.selectbox("Color de la marca", list(COLORES), index=list(COLORES).index("rojo"))
-    ventana = col3.selectbox("Ventana de filtrado (cuadros)", [7, 11, 21, 41], index=1)
+    eje = col1.selectbox(
+        "Eje de oscilación",
+        ["y", "x"],
+        format_func=lambda v: "Vertical (y)" if v == "y" else "Horizontal (x)",
+        help="Y = oscilación vertical (sube/baja). X = oscilación horizontal (se desplaza lateralmente). Elegir según el movimiento del video.",
+    )
+    color = col2.selectbox(
+        "Color de la marca",
+        list(COLORES),
+        index=list(COLORES).index("rojo"),
+        help="Color de la marca/punto que el tracker HSV debe seguir.",
+    )
+    ventana = col3.selectbox("Ventana de filtrado (cuadros)", [7, 11, 21, 41], index=1, help="Ventana de Savitzky-Golay para filtrar x/v/a.")
 
     st.subheader("Opciones")
     usar_fps = st.checkbox("Ingresar FPS real medido")
@@ -110,8 +141,10 @@ with st.form("parametros_analisis"):
         value=30.0,
         step=0.1,
         disabled=not usar_fps,
+        help="Solo marcar si mediste el FPS real (LED o cronómetro) con el mismo setup. Si no lo hiciste, dejalo sin marcar.",
     )
     with st.expander("Chequeo estático opcional"):
+        st.caption("Opcional. Solo sirve para calcular k por F = kx. NO es necesario para obtener k dinámico con el ajuste x(t).")
         masas_texto = st.text_input("Masas estáticas (kg, separadas por comas)")
         elongaciones_texto = st.text_input("Elongaciones (m, separadas por comas)")
         usar_sigma_elongacion = st.checkbox("Indicar incerteza de elongación")
