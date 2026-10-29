@@ -61,12 +61,13 @@ def fmt_agregado(agg, unidad=""):
     return f"{txt} {unidad}".strip()
 
 
-def analizar(video, a, escala, carpeta):
+def analizar(video, a, escala, carpeta, progreso=None):
     nombre = os.path.splitext(os.path.basename(video))[0]
     px_csv, m_csv = f"{carpeta}/{nombre}_px.csv", f"{carpeta}/{nombre}_m.csv"
 
-    filas = trackear(video, px_csv, color=a.color)
+    filas = trackear(video, px_csv, progreso=progreso)
     perdidos = float(np.isnan(filas[:, 1]).mean())
+    seguimiento = dict(getattr(filas, "resumen", {}))
 
     cap = cv2.VideoCapture(video)
     fps_decl = cap.get(cv2.CAP_PROP_FPS)
@@ -84,7 +85,10 @@ def analizar(video, a, escala, carpeta):
 
     t, xm, ym, sxm, sym = a_metros(px_csv, m_csv, escala[0], escala[1])
     t = t * fps_decl / fps_uso                      # corrección por fps real
-    x, sx = (xm, sxm) if a.eje == "x" else (ym, sym)
+    std_x = np.nanstd(xm)
+    std_y = np.nanstd(ym)
+    eje = "y" if std_y > std_x else "x"
+    x, sx = (ym, sym) if eje == "y" else (xm, sxm)
     x, _ = rellenar_nan(t, x)
     sx = np.where(np.isnan(sx), np.nanmedian(sx), sx)
 
@@ -125,9 +129,10 @@ def analizar(video, a, escala, carpeta):
     comp = comparar_crudo_filtrado(r, corr_v=corr)
     comp["RMS a / a_max del ajuste"] = comp["RMS a (m/s²)"] / mx["a_max (m/s²)"]
     return dict(
-        nombre=nombre, T=T, omega=p["omega"], gamma=c["gamma"],
+        nombre=nombre, eje=eje, T=T, omega=p["omega"], gamma=c["gamma"],
         k=c["k_con_mef"], k_sin=c["k_sin_mef"],
-        A=p["A"], redchi=res.redchi, perdidos=perdidos,
+        A=p["A"], C=p["C"], phi=p["phi"], redchi=res.redchi, perdidos=perdidos,
+        seguimiento=seguimiento,
         ciclos=(t[-1] - t[0]) / T.n, muestras_T=T.n * fps_uso,
         fps_decl=fps_decl, fps_uso=fps_uso, fps_sigma=fps_sigma, fps_origen=origen,
         maximos=mx, energia=energia, comp=comp,
@@ -176,157 +181,169 @@ def calcular_agregados(res):
     return {clave: agregado([r[clave] for r in res]) for clave, _, _ in VARIABLES_AGREGADAS}
 
 
-def resultados_json(res):
-    """Lista por video (claves T/gamma/k/k_sin intactas) + entrada "agregado".
+def _medida_json(valor, unidad):
+    """Representa una magnitud con valor, incertidumbre y unidad explícitos."""
+    if hasattr(valor, "n") and hasattr(valor, "s"):
+        return {"valor": float(valor.n), "incerteza": float(valor.s), "unidad": unidad}
+    return {"valor": float(valor), "unidad": unidad}
 
-    En la entrada agregada se conservan T/gamma/k/k_sin como [media, σ_tot] y se
-    agregan <clave>_est, <clave>_sis y <clave>_tot para cada variable agregada.
-    """
-    filas = []
+
+def resultados_json(res):
+    """Devuelve una estructura legible y versionada para humanos y programas."""
+    definiciones = {
+        "periodo": ("T", "s"),
+        "frecuencia_angular": ("omega", "rad/s"),
+        "amortiguamiento": ("gamma", "1/s"),
+        "constante_elastica_con_masa_efectiva": ("k", "N/m"),
+        "constante_elastica_sin_masa_efectiva": ("k_sin", "N/m"),
+        "amplitud": ("A", "m"),
+        "posicion_de_equilibrio": ("C", "m"),
+        "fase_inicial": ("phi", "rad"),
+    }
+    videos = []
     for r in res:
-        fila = {clave: [r[clave].n, r[clave].s] for clave, _, _ in VARIABLES_AGREGADAS}
-        fila["video"] = r["nombre"]
-        filas.append(fila)
+        seg = r.get("seguimiento", {})
+        total = int(seg.get("cuadros", 0))
+        detectados = int(seg.get("detectados", total - round(r["perdidos"] * total)))
+        calidad = "aceptable" if r["perdidos"] <= .05 and .3 <= r["redchi"] <= 3 and r["ciclos"] >= 5 else "revisar"
+        alertas = []
+        if r["perdidos"] > .05: alertas.append("más de 5 % de cuadros sin detección")
+        if r["redchi"] < .3 or r["redchi"] > 3: alertas.append("chi cuadrado reducido fuera del rango orientativo 0.3–3")
+        if r["ciclos"] < 5: alertas.append("menos de 5 ciclos observados")
+        if r["muestras_T"] < 10: alertas.append("menos de 10 cuadros por período")
+        if r["gamma"].n < 2*r["gamma"].s: alertas.append("amortiguamiento compatible con cero")
+        resultados = {nombre: _medida_json(r[clave], unidad)
+                      for nombre, (clave, unidad) in definiciones.items()}
+        resultados["chi_cuadrado_reducido"] = {"valor": float(r["redchi"]), "unidad": ""}
+        resultados["maximos"] = {
+            nombre: _medida_json(valor, nombre.rpartition("(")[2].rstrip(")"))
+            for nombre, valor in r["maximos"].items()
+        }
+        resultados["energia"] = {nombre: _medida_json(valor, "J")
+                                  for nombre, valor in r["energia"].items()}
+        videos.append({
+            "video": r["nombre"],
+            "estado": calidad,
+            "alertas": alertas,
+            "seguimiento": {
+                "cuadros_totales": total,
+                "cuadros_detectados": detectados,
+                "cuadros_perdidos": total - detectados,
+                "porcentaje_perdido": 100 * float(r["perdidos"]),
+                "eje_de_oscilacion": r["eje"],
+                "cuadros_con_candidatos_multiples": int(seg.get("frames_con_multiples_candidatos", 0)),
+                "saltos_descartados": int(seg.get("saltos_descartados", 0)),
+            },
+            "ajuste": {
+                "ciclos_observados": float(r["ciclos"]),
+                "cuadros_por_periodo": float(r["muestras_T"]),
+            },
+            "fps": {"declarados": float(r["fps_decl"]), "usados": float(r["fps_uso"]),
+                    "incerteza": float(r["fps_sigma"]), "origen": r["fps_origen"]},
+            "resultados": resultados,
+        })
+
+    salida = {
+        "version_formato": 2,
+        "descripcion": "Análisis de oscilaciones de un resorte. Incertidumbre en las unidades de cada magnitud.",
+        "cantidad_videos_analizados": len(res),
+        "videos": videos,
+    }
     if res:
         agregados = calcular_agregados(res)
-        fila = {"video": "agregado", "N": len(res)}
-        for clave, _, _ in VARIABLES_AGREGADAS:
-            agg = agregados[clave]
-            fila[clave] = [agg["media"], agg["tot"]]
-            fila[clave + "_est"] = agg["est"]
-            fila[clave + "_sis"] = agg["sis"]
-            fila[clave + "_tot"] = agg["tot"]
-        filas.append(fila)
-    return filas
+        claves = {"periodo": ("T", "s"), "frecuencia_angular": ("omega", "rad/s"),
+                  "amortiguamiento": ("gamma", "1/s"),
+                  "constante_elastica_con_masa_efectiva": ("k", "N/m"),
+                  "constante_elastica_sin_masa_efectiva": ("k_sin", "N/m")}
+        salida["resultado_agregado"] = {
+            "cantidad_repeticiones": len(res),
+            "magnitudes": {nombre: {
+                "valor": float(agregados[clave]["media"]),
+                "incerteza_estadistica": float(agregados[clave]["est"]),
+                "incerteza_sistematica": float(agregados[clave]["sis"]),
+                "incerteza_total": float(agregados[clave]["tot"]), "unidad": unidad,
+            } for nombre, (clave, unidad) in claves.items()},
+        }
+    return salida
 
 
 def escribir_informe(res, fallidos, a, escala, k_e, ruta):
-    L = ["# Informe automático: resorte (MAS)", ""]
-    L.append(f"- Videos analizados: {len(res)} | fallidos: {len(fallidos)}")
-    L.append(f"- Masa colgante: {fmt(ufloat(a.masa, a.sigma_masa), 'kg')} | "
-             f"masa del resorte: {fmt(ufloat(a.masa_resorte, a.sigma_masa_resorte), 'kg')}")
-    L.append(f"- Escala espacial: {fmt(ufloat(*escala), 'px/m')}")
-    L.append(f"- Eje de oscilación: {a.eje} | ventana Savitzky-Golay: {a.ventana}")
+    """Escribe primero el resumen útil y luego los detalles para revisar el análisis."""
+    L = ["# Análisis del resorte: resultados", "", "## Resumen", "",
+         f"- Videos analizados correctamente: **{len(res)}**",
+         f"- Videos con errores: **{len(fallidos)}**",
+         f"- Masa colgante: **{fmt(ufloat(a.masa, a.sigma_masa), 'kg')}**",
+         f"- Masa del resorte: **{fmt(ufloat(a.masa_resorte, a.sigma_masa_resorte), 'kg')}**",
+         f"- Escala espacial: **{fmt(ufloat(*escala), 'px/m')}**",
+         f"- Filtro de señal: **{a.ventana} cuadros**", "",
+         "Los valores se expresan como valor ± incertidumbre. **Revisar** indica que el seguimiento "
+         "o el ajuste no cumple al menos uno de los criterios orientativos.", "", "## Resultados por video", ""]
     if res:
-        r0 = res[0]
-        if r0["fps_sigma"]:
-            delta = (r0["fps_uso"] - r0["fps_decl"]) / r0["fps_decl"] if r0["fps_decl"] else 0.0
-            L.append(f"- fps usado: {r0['fps_uso']:.4f} ± {r0['fps_sigma']:.4f} fps | "
-                     f"origen: {r0['fps_origen']} | σ propagada a T, γ y k | "
-                     f"declarado por los videos: {r0['fps_decl']:.4f} fps ({100 * delta:+.1f} %)")
-            L.append("- σ_fps incluida también en Ec_max y Et (v y a por diferencias finitas: v·corr, "
-                     "a·corr²) y en RMS v / RMS a del cuadro crudo vs filtrado; Ep, v_max, a_max y los "
-                     "t de los máximos ya la traían vía k y ω, y la misma variable corr evita "
-                     "duplicarla en Et y en RMS a / a_max.")
-        else:
-            L.append(f"- fps usado: {r0['fps_uso']:.4f} fps | "
-                     f"origen: {r0['fps_origen']} | sin incerteza estimada")
-    L += ["", "## Resultados por video", "",
-          "| video | T (s) | ω (rad/s) | γ (1/s) | k con m_ef (N/m) | k sin m_ef (N/m) | χ² red. |",
-          "|---|---|---|---|---|---|---|"]
-    for r in res:
-        L.append(f"| {r['nombre']} | {fmt(r['T'])} | {fmt(r['omega'])} | {fmt(r['gamma'])} | "
-                 f"{fmt(r['k'])} | {fmt(r['k_sin'])} | {r['redchi']:.2f} |")
-
-    T_med = None
-    if res:
-        agregados = calcular_agregados(res)
-        L += ["", "## Resultado agregado (media ± σ_est ± σ_sis)", ""]
-        for clave, nom, unid in VARIABLES_AGREGADAS:
-            agg = agregados[clave]
-            if agg["dispersion"] is not None:
-                extra = f" | dispersión entre repeticiones s = {agg['dispersion']:.3g} {unid}"
-            else:
-                extra = " | N=1: σ_est = incerteza del ajuste individual (no hay dispersión)"
-            L.append(f"- {nom} = {fmt_agregado(agg, unid)}{extra}")
-        L += ["",
-              "σ_est = dispersión entre los valores nominales de los videos / √N (ddof=1); con N=1, "
-              "incerteza del ajuste individual. σ_sis = aporte de las variables comunes (fps medido "
-              "con un único LED, masa y masa del resorte), propagado sin dividir por √N. "
-              "σ_tot = √(σ_est² + σ_sis²). La escala espacial también es común, pero T, ω, γ y k no "
-              "dependen de ella (sí A, x y energías, que no se agregan).", ""]
-        faltan = []
-        if not res[0]["fps_sigma"]:
-            faltan.append("fps")
-        if a.sigma_masa == 0:
-            faltan.append("masa")
-        if a.sigma_masa_resorte == 0:
-            faltan.append("masa del resorte")
-        if faltan:
-            L.append("Sin incerteza declarada para " + ", ".join(faltan) +
-                     ": su aporte a σ_sis es 0 y σ_sis sólo incluye las componentes disponibles.")
-            L.append("")
-        T_med = ufloat(agregados["T"]["media"], agregados["T"]["tot"])
-
-        L += ["", "## Máximos (primer video, valores del ajuste con incerteza, x desde el equilibrio)", ""]
-        for k_, v in res[0]["maximos"].items():
-            L.append(f"- {k_}: {fmt(v)}")
-
-        L += ["", "## Energía (primer video, datos filtrados, incerteza propagada)", "",
-              "| cantidad | valor con incerteza |", "|---|---|"]
-        for k_, v in res[0]["energia"].items():
-            L.append(f"| {k_} | {fmt(v)} |")
-
-        claves = list(res[0]["comp"].keys())
-        L += ["", f"## Crudo vs filtrado (Savitzky-Golay, ventana = {a.ventana} cuadros)", "",
-              "| video | " + " | ".join(claves) + " |",
-              "|---|" + "---|" * len(claves)]
-        prom = {k_: [] for k_ in claves}
+        L += ["| Video | Estado | Período T (s) | Frecuencia angular ω (rad/s) | Amortiguamiento γ (1/s) | k con masa efectiva (N/m) | k sin masa efectiva (N/m) |",
+              "|---|---|---:|---:|---:|---:|---:|"]
         for r in res:
-            celdas = []
-            for k_ in claves:
-                v = r["comp"][k_]
-                celdas.append(fmt(v) if hasattr(v, "n") else f"{v:.4f}")
-                prom[k_].append(v)
+            estado = "Aceptable" if r["perdidos"] <= .05 and .3 <= r["redchi"] <= 3 and r["ciclos"] >= 5 else "Revisar"
+            L.append(f"| {r['nombre']} | {estado} | {fmt(r['T'])} | {fmt(r['omega'])} | {fmt(r['gamma'])} | {fmt(r['k'])} | {fmt(r['k_sin'])} |")
+
+        L += ["", "## Seguimiento de la pesa", "",
+              "Los cuadros perdidos se interpolan antes del ajuste. Si son muchos, los resultados pueden perder precisión.", "",
+              "| Video | Cuadros | Detectados | Perdidos | Perdidos (%) | Eje | Cuadros con varios candidatos | Saltos descartados |",
+              "|---|---:|---:|---:|---:|---|---:|---:|"]
+        for r in res:
+            s = r.get("seguimiento", {})
+            n = int(s.get("cuadros", 0))
+            nd = int(s.get("detectados", n - round(r["perdidos"] * n)))
+            L.append(f"| {r['nombre']} | {n} | {nd} | {n-nd} | {100*r['perdidos']:.1f} % | {r['eje']} | {s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |")
+
+        L += ["", "## Calidad del ajuste", "",
+              "| Video | χ² reducido | Ciclos observados | Cuadros por período | FPS usado | Origen del FPS |",
+              "|---|---:|---:|---:|---:|---|"]
+        for r in res:
+            L.append(f"| {r['nombre']} | {r['redchi']:.3g} | {r['ciclos']:.2f} | {r['muestras_T']:.1f} | {r['fps_uso']:.4g} fps | {r['fps_origen']} |")
+        L += ["", "Como guía, el estado aceptable requiere hasta 5 % de cuadros perdidos, χ² reducido entre 0.3 y 3 y al menos 5 ciclos. Revisá también los gráficos.", "",
+              "## Resultado combinado de las repeticiones", "",
+              "σ estadística representa la variación entre repeticiones (o la incertidumbre del ajuste con una repetición). "
+              "σ sistemática incluye errores comunes, como masa y FPS. σ total combina ambas.", "",
+              "| Magnitud | Media | σ estadística | σ sistemática | σ total |",
+              "|---|---:|---:|---:|---:|"]
+        agregados = calcular_agregados(res)
+        for clave, nombre, unidad in VARIABLES_AGREGADAS:
+            v = agregados[clave]
+            L.append(f"| {nombre} ({unidad}) | {v['media']:.6g} | {v['est']:.3g} | {v['sis']:.3g} | {v['tot']:.3g} |")
+        L += ["", "## Otros resultados del primer video", "", "### Máximos calculados", ""]
+        L.extend(f"- **{nombre}:** {fmt(valor)}" for nombre, valor in res[0]["maximos"].items())
+        L += ["", "### Energías", "", "| Magnitud | Resultado |", "|---|---:|"]
+        L.extend(f"| {nombre} | {fmt(valor)} |" for nombre, valor in res[0]["energia"].items())
+        claves = list(res[0]["comp"])
+        L += ["", f"## Señal cruda frente a filtrada (ventana {a.ventana})", "",
+              "| Video | " + " | ".join(claves) + " |", "|---|" + "---|" * len(claves)]
+        for r in res:
+            celdas = [fmt(r["comp"][k]) if hasattr(r["comp"][k], "n") else f"{r['comp'][k]:.4f}" for k in claves]
             L.append(f"| {r['nombre']} | " + " | ".join(celdas) + " |")
-        promedio = []
-        for k_ in claves:
-            vals = prom[k_]
-            media = (sum(vals) / len(vals)) if hasattr(vals[0], "n") else float(np.mean(vals))
-            promedio.append(fmt(media) if hasattr(media, "n") else f"{media:.4f}")
-        L.append("| promedio | " + " | ".join(promedio) + " |")
-        L.append("")
-        L.append("El RMS de a crudo sobre la amplitud de a del ajuste mide cuánto amplifica "
-                 "el ruido la segunda derivada sin filtrar.")
+        if k_e is not None:
+            agg = calcular_agregados(res)["T"]
+            t_med = ufloat(agg["media"], agg["tot"])
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                chequeo_periodo(k_e, ufloat(a.masa, a.sigma_masa), ufloat(a.masa_resorte, a.sigma_masa_resorte), t_med)
+            L += ["", "## Comparación con la medición estática", "",
+                  f"Constante elástica estática: **{fmt(k_e, 'N/m')}**", "", "```text", buf.getvalue().rstrip(), "```"]
 
-    if k_e is not None and T_med is not None:
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            chequeo_periodo(k_e, ufloat(a.masa, a.sigma_masa),
-                            ufloat(a.masa_resorte, a.sigma_masa_resorte), T_med)
-        L += ["", "## Chequeo físico: período con y sin masa efectiva", "",
-              f"k estático = {fmt(k_e, 'N/m')}", "", "```", buf.getvalue().rstrip(), "```"]
-
-    # Limitaciones detectadas automáticamente
-    lim = []
+    limitaciones = []
     for r in res:
-        if r["perdidos"] > 0.05:
-            lim.append(f"{r['nombre']}: {100 * r['perdidos']:.1f} % de cuadros sin detección (rellenados por interpolación).")
-        if r["redchi"] > 3 or r["redchi"] < 0.3:
-            lim.append(f"{r['nombre']}: χ² reducido = {r['redchi']:.2f}; σ del tracking mal estimadas o modelo inadecuado.")
-        if r["ciclos"] < 5:
-            lim.append(f"{r['nombre']}: solo {r['ciclos']:.1f} ciclos observados; T y k menos precisos.")
-        if r["muestras_T"] < 10:
-            lim.append(f"{r['nombre']}: {r['muestras_T']:.1f} cuadros por período (<10); riesgo de submuestreo.")
-        if r["gamma"].n < 2 * r["gamma"].s:
-            lim.append(f"{r['nombre']}: γ compatible con 0 (amortiguamiento no detectable).")
-    if len(res) < 5:
-        lim.append(f"Solo {len(res)} repeticiones; la receta pide entre 5 y 20.")
-    if not a.fps_real and not getattr(a, "fps_led", None):
-        lim.append("fps real no verificado: se usó el fps declarado por el video.")
-    if getattr(a, "fps_led_aviso", None):
-        lim.append(a.fps_led_aviso + ".")
-    if k_e is None:
-        lim.append("No se hizo el chequeo del período: falta k estático independiente.")
-    elif a.sigma_elongacion is None:
-        lim.append("k estático sin --sigma-elongacion: la incerteza de k no incluye la de las "
-                   "elongaciones medidas (sólo la dispersión de la recta y σg).")
-    for nombre, err in fallidos:
-        lim.append(f"{nombre}: falló el análisis ({err}).")
-    L += ["", "## Limitaciones detectadas automáticamente", ""] + [f"- {x}" for x in lim]
-    L += ["", "## Limitaciones (completar a mano)", "",
-          "- Qué falló:", "- En qué condición se rompe:", "- Qué quedó sin resolver:"]
-
+        if r["perdidos"] > .05: limitaciones.append(f"{r['nombre']}: {100*r['perdidos']:.1f} % de cuadros sin detección; se interpolaron.")
+        if r["redchi"] > 3 or r["redchi"] < .3: limitaciones.append(f"{r['nombre']}: χ² reducido {r['redchi']:.2f}; el modelo puede no describir bien los datos.")
+        if r["ciclos"] < 5: limitaciones.append(f"{r['nombre']}: solo {r['ciclos']:.1f} ciclos; T y k pueden ser poco precisos.")
+        if r["muestras_T"] < 10: limitaciones.append(f"{r['nombre']}: {r['muestras_T']:.1f} cuadros por período; posible submuestreo.")
+        if r["gamma"].n < 2*r["gamma"].s: limitaciones.append(f"{r['nombre']}: amortiguamiento compatible con cero dentro de 2 incertidumbres.")
+    if len(res) < 5: limitaciones.append(f"Se analizaron {len(res)} repeticiones; la receta recomienda entre 5 y 20.")
+    if res and not res[0]["fps_sigma"]: limitaciones.append("FPS real no verificado; se usó el FPS del video o el valor ingresado.")
+    if getattr(a, "fps_led_aviso", None): limitaciones.append(a.fps_led_aviso)
+    if k_e is None: limitaciones.append("No se comparó con una k estática porque no se ingresaron esos datos.")
+    elif a.sigma_elongacion is None: limitaciones.append("La incertidumbre de las elongaciones no está incluida en la k estática.")
+    limitaciones.extend(f"{nombre}: error durante el análisis: {error}" for nombre, error in fallidos)
+    L += ["", "## Observaciones y limitaciones", ""]
+    L += [f"- {x}" for x in limitaciones] if limitaciones else ["- No se detectaron limitaciones automáticas."]
     with open(ruta, "w", encoding="utf-8") as f:
         f.write("\n".join(L) + "\n")
 
@@ -347,7 +364,6 @@ def main():
     ap.add_argument("--f-led", type=float, help="frecuencia conocida del LED (Hz)")
     ap.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
                     help="región del LED en el cuadro; si no se da, se usa todo el cuadro")
-    ap.add_argument("--eje", choices=["x", "y"], default="x", help="x: horizontal, y: vertical")
     ap.add_argument("--ventana", type=int, default=11)
     ap.add_argument("--masas-estaticas", type=float, nargs="+")
     ap.add_argument("--elongaciones", type=float, nargs="+")
@@ -356,7 +372,6 @@ def main():
     ap.add_argument("--sigma-g", type=float, default=0.01,
                     help="incerteza de g en el k estático (m/s², default 0.01)")
     ap.add_argument("--salidas", default="salidas")
-    ap.add_argument("--color", choices=["rojo", "naranja", "amarillo", "verde", "azul", "negro"], default="rojo")
     a = ap.parse_args()
 
     if a.px_por_m is None and a.regla_m is None:
