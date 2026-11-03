@@ -61,11 +61,13 @@ def fmt_agregado(agg, unidad=""):
     return f"{txt} {unidad}".strip()
 
 
-def analizar(video, a, escala, carpeta, progreso=None):
+def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
     nombre = os.path.splitext(os.path.basename(video))[0]
     px_csv, m_csv = f"{carpeta}/{nombre}_px.csv", f"{carpeta}/{nombre}_m.csv"
 
-    filas = trackear(video, px_csv, progreso=progreso)
+    filas = trackear(
+        video, px_csv, progreso=progreso, punto_inicial=punto_inicial
+    )
     perdidos = float(np.isnan(filas[:, 1]).mean())
     seguimiento = dict(getattr(filas, "resumen", {}))
 

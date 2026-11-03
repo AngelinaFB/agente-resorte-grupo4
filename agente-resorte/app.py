@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import tempfile
@@ -8,11 +9,17 @@ from types import SimpleNamespace
 import cv2
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 
 from calibracion import escala_px_por_m
 from main import analizar, escribir_informe, resultados_json, variables_comunes
 from ajuste import k_estatico
+from tracking import trackear
 
+seleccionar_punto_tracking = components.declare_component(
+    "selector_punto_tracking",
+    path=str(Path(__file__).parent / "selector_punto_tracking"),
+)
 
 st.set_page_config(page_title="Análisis de resorte", page_icon="🌀", layout="wide")
 if "analisis_ocupado" not in st.session_state:
@@ -59,6 +66,51 @@ def primer_cuadro_video(contenido, nombre):
         return cv2.cvtColor(cuadro, cv2.COLOR_BGR2RGB), (ancho, alto)
 
 
+def crear_video_tracking(contenido, nombre, punto_inicial, progreso=None):
+    """Genera una copia del video con el punto seleccionado resaltado."""
+    with tempfile.TemporaryDirectory(prefix="resorte-tracking-") as temp_dir:
+        ruta_video = Path(temp_dir) / Path(nombre).name
+        ruta_salida = Path(temp_dir) / "tracking.mp4"
+        ruta_video.write_bytes(contenido)
+
+        captura = cv2.VideoCapture(str(ruta_video))
+        fps = captura.get(cv2.CAP_PROP_FPS)
+        ancho = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))
+        alto = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        captura.release()
+        if fps <= 0 or ancho <= 0 or alto <= 0:
+            raise RuntimeError("No se pudieron leer los datos del video para previsualizar el tracking.")
+
+        escritor = cv2.VideoWriter(
+            str(ruta_salida),
+            cv2.VideoWriter_fourcc(*"avc1"),
+            fps,
+            (ancho, alto),
+        )
+        if not escritor.isOpened():
+            escritor.release()
+            raise RuntimeError("No se pudo crear el video de previsualización del tracking.")
+        try:
+            tabla = trackear(
+                str(ruta_video),
+                str(Path(temp_dir) / "tracking.csv"),
+                progreso=progreso,
+                frame_callback=escritor.write,
+                punto_inicial=punto_inicial,
+            )
+        finally:
+            escritor.release()
+
+        if not ruta_salida.is_file() or ruta_salida.stat().st_size == 0:
+            raise RuntimeError("El video de previsualización del tracking quedó vacío.")
+        verificador = cv2.VideoCapture(str(ruta_salida))
+        video_valido, _ = verificador.read()
+        verificador.release()
+        if not video_valido:
+            raise RuntimeError("No se pudo verificar el video de previsualización del tracking.")
+        return ruta_salida.read_bytes(), tabla.resumen
+
+
 videos = st.file_uploader(
     "Videos del experimento",
     type=["mp4", "avi", "mov", "mkv"],
@@ -67,6 +119,7 @@ videos = st.file_uploader(
 )
 
 frame_size = None
+punto_tracking = None
 if videos:
     frame_preview, frame_size = primer_cuadro_video(videos[0].getvalue(), videos[0].name)
     if frame_preview is None:
@@ -74,6 +127,128 @@ if videos:
     else:
         st.caption(f"Cuadro de referencia ({frame_size[0]} × {frame_size[1]} px)")
         st.image(frame_preview, width=520)
+
+if videos:
+    firma_videos = tuple((video.file_id, video.name) for video in videos)
+    col_video, col_boton = st.columns([3, 1])
+    indice_tracking = col_video.selectbox(
+        "Video para revisar",
+        options=range(len(videos)),
+        format_func=lambda indice: videos[indice].name,
+        key="indice_video_tracking",
+    )
+    video_seleccionado = videos[indice_tracking]
+    cuadro_tracking, tamano_tracking = primer_cuadro_video(
+        video_seleccionado.getvalue(), video_seleccionado.name
+    )
+    clave_punto = f"punto_tracking_{video_seleccionado.file_id}"
+    if cuadro_tracking is None or tamano_tracking is None:
+        st.error("No se pudo leer el primer cuadro del video para seleccionar la masa.")
+    else:
+        st.caption(
+            "Hacé clic en el punto exacto de la masa en el primer cuadro. "
+            "El seguimiento arranca en ese píxel y continúa por flujo óptico, sin buscar el color rojo."
+        )
+        ok, imagen_jpeg = cv2.imencode(
+            ".jpg", cv2.cvtColor(cuadro_tracking, cv2.COLOR_RGB2BGR)
+        )
+        if not ok:
+            raise RuntimeError("No se pudo preparar el cuadro para seleccionar el punto de tracking.")
+        imagen_data = "data:image/jpeg;base64," + base64.b64encode(
+            imagen_jpeg.tobytes()
+        ).decode("ascii")
+        punto_seleccionado = seleccionar_punto_tracking(
+            image_data=imagen_data,
+            image_width=tamano_tracking[0],
+            image_height=tamano_tracking[1],
+            selected_point=st.session_state.get(clave_punto),
+            default=None,
+            key=f"selector_{video_seleccionado.file_id}",
+        )
+        if isinstance(punto_seleccionado, dict):
+            try:
+                x = int(punto_seleccionado["x"])
+                y = int(punto_seleccionado["y"])
+            except (KeyError, TypeError, ValueError):
+                st.session_state.pop(clave_punto, None)
+            else:
+                if 0 <= x < tamano_tracking[0] and 0 <= y < tamano_tracking[1]:
+                    st.session_state[clave_punto] = {"x": x, "y": y}
+        punto_guardado = st.session_state.get(clave_punto)
+        if isinstance(punto_guardado, dict):
+            punto_tracking = (punto_guardado["x"], punto_guardado["y"])
+        if punto_tracking is not None:
+            st.success(
+                f"Punto inicial seleccionado: ({punto_tracking[0]}, {punto_tracking[1]}) px. "
+                "Podés volver a hacer clic para cambiarlo."
+            )
+        else:
+            st.info("Seleccioná el punto inicial de la masa para habilitar el tracking.")
+
+    if col_boton.button(
+        "Ver tracking de la masa",
+        type="secondary",
+        disabled=punto_tracking is None,
+    ):
+        barra_tracking = st.progress(0, text="Preparando la vista del tracking…")
+
+        def actualizar_progreso_tracking(actual, total):
+            if total:
+                porcentaje = min(int(100 * actual / total), 99)
+                barra_tracking.progress(
+                    porcentaje,
+                    text=f"Procesando cuadro {actual:,} de {total:,} ({porcentaje}%)",
+                )
+            else:
+                barra_tracking.progress(
+                    0, text=f"Procesando cuadro {actual:,}… (duración no informada)"
+                )
+
+        try:
+            with st.spinner("Siguiendo el punto seleccionado y preparando la vista…"):
+                video_tracking, resumen_tracking = crear_video_tracking(
+                    video_seleccionado.getvalue(),
+                    video_seleccionado.name,
+                    punto_inicial=punto_tracking,
+                    progreso=actualizar_progreso_tracking,
+                )
+            st.session_state["vista_tracking"] = {
+                "firma": firma_videos,
+                "indice": indice_tracking,
+                "formato": "mp4",
+                "algoritmo": "punto-inicial-flujo-optico-v5",
+                "punto_inicial": punto_tracking,
+                "video": video_tracking,
+                "resumen": resumen_tracking,
+            }
+            barra_tracking.progress(100, text="Vista de tracking lista")
+        except Exception as exc:
+            barra_tracking.empty()
+            st.error(f"No se pudo generar la vista de tracking: {type(exc).__name__}: {exc}")
+
+    vista_tracking = st.session_state.get("vista_tracking")
+    if (
+        vista_tracking
+        and vista_tracking["firma"] == firma_videos
+        and vista_tracking["indice"] == indice_tracking
+        and vista_tracking.get("formato") == "mp4"
+        and vista_tracking.get("algoritmo") == "punto-inicial-flujo-optico-v5"
+        and vista_tracking.get("punto_inicial") == punto_tracking
+    ):
+        resumen = vista_tracking["resumen"]
+        st.video(vista_tracking["video"], format="video/mp4")
+        st.caption(
+            f"Método: {resumen['metodo']} · "
+            f"Detecciones: {resumen['detectados']}/{resumen['cuadros']} cuadros · "
+            f"Sin detección: {resumen['perdidos']} · "
+            f"Saltos descartados: {resumen['saltos_descartados']}. "
+            "El círculo verde marca el punto seleccionado; rojo indica un cuadro perdido."
+        )
+        if resumen["cuadros"] and resumen["perdidos"] / resumen["cuadros"] > 0.05:
+            st.warning(
+                "Se perdió más del 5 % del seguimiento. Revisá que el punto seleccionado "
+                "se vea con nitidez y que la masa no quede oculta."
+            )
 
 st.subheader("Datos del experimento")
 c_masa, c_sigma, c_resorte, c_sigma_resorte, _ = st.columns([1.1, 1.1, 1.1, 1.1, 2.5])
@@ -151,7 +326,12 @@ with st.form("parametros_analisis"):
 
     ejecutar = st.form_submit_button(
         "Analizando…" if st.session_state.analisis_ocupado else "Analizar videos",
-        type="primary", disabled=not videos or st.session_state.analisis_ocupado,
+        type="primary",
+        disabled=(
+            not videos
+            or punto_tracking is None
+            or st.session_state.analisis_ocupado
+        ),
     )
 
 firma = (
@@ -167,6 +347,7 @@ firma = (
     elongaciones_texto,
     usar_sigma_elongacion,
     sigma_elongacion if usar_sigma_elongacion else None,
+    punto_tracking,
 )
 
 if ejecutar and not st.session_state.analisis_ocupado:
@@ -177,6 +358,8 @@ if ejecutar and not st.session_state.analisis_ocupado:
 if st.session_state.analisis_ocupado:
     if not videos:
         st.session_state["error_analisis"] = "Cargá al menos un video."
+    elif punto_tracking is None:
+        st.session_state["error_analisis"] = "Hacé clic en el punto de la masa antes de analizar."
     elif not frame_size or puntos is None:
         st.session_state["error_analisis"] = "No se pudo leer el primer cuadro para calibrar la regla. Revisá el video."
     else:
@@ -254,7 +437,12 @@ if st.session_state.analisis_ocupado:
 
                     try:
                         resultados.append(analizar(
-                            ruta, args, escala, str(salidas_dir), progreso=actualizar_progreso
+                            ruta,
+                            args,
+                            escala,
+                            str(salidas_dir),
+                            progreso=actualizar_progreso,
+                            punto_inicial=punto_tracking,
                         ))
                     except Exception as exc:
                         fallidos.append((Path(ruta).name, str(exc)))

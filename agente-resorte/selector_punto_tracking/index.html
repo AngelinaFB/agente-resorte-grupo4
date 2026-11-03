@@ -1,0 +1,100 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      body {
+        margin: 0;
+        color: #e6e9ef;
+        font-family: sans-serif;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        cursor: crosshair;
+      }
+      .hint {
+        margin: 0 0 6px;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <p class="hint">Hacé clic sobre el punto rojo de la masa.</p>
+    <canvas id="frame"></canvas>
+    <script>
+      const canvas = document.getElementById("frame");
+      const context = canvas.getContext("2d");
+      const image = new Image();
+      let args = null;
+      let selectedPoint = null;
+
+      function send(type, data) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type }, data),
+          "*"
+        );
+      }
+
+      function draw() {
+        if (!args || !image.complete || !image.naturalWidth) return;
+        canvas.width = args.image_width;
+        canvas.height = args.image_height;
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        if (selectedPoint) {
+          context.beginPath();
+          context.arc(selectedPoint.x, selectedPoint.y, 10, 0, 2 * Math.PI);
+          context.strokeStyle = "#00ff66";
+          context.lineWidth = Math.max(2, canvas.width / 400);
+          context.stroke();
+          context.beginPath();
+          context.moveTo(selectedPoint.x - 15, selectedPoint.y);
+          context.lineTo(selectedPoint.x + 15, selectedPoint.y);
+          context.moveTo(selectedPoint.x, selectedPoint.y - 15);
+          context.lineTo(selectedPoint.x, selectedPoint.y + 15);
+          context.stroke();
+        }
+        send("streamlit:setFrameHeight", { height: canvas.clientHeight + 30 });
+      }
+
+      image.onload = draw;
+      canvas.addEventListener("click", (event) => {
+        if (!args) return;
+        const bounds = canvas.getBoundingClientRect();
+        selectedPoint = {
+          x: Math.max(
+            0,
+            Math.min(
+              args.image_width - 1,
+              Math.round((event.clientX - bounds.left) * args.image_width / bounds.width)
+            )
+          ),
+          y: Math.max(
+            0,
+            Math.min(
+              args.image_height - 1,
+              Math.round((event.clientY - bounds.top) * args.image_height / bounds.height)
+            )
+          ),
+        };
+        draw();
+        send("streamlit:setComponentValue", {
+          value: selectedPoint,
+          dataType: "json",
+        });
+      });
+
+      window.addEventListener("message", (event) => {
+        if (!event.data || event.data.type !== "streamlit:render") return;
+        args = event.data.args;
+        selectedPoint = args.selected_point || null;
+        if (image.src !== args.image_data) image.src = args.image_data;
+        else draw();
+      });
+
+      send("streamlit:componentReady", { apiVersion: 1 });
+      send("streamlit:setFrameHeight", { height: 360 });
+    </script>
+  </body>
+</html>
