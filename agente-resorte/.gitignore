@@ -1,0 +1,7 @@
+﻿
+# Chatbot: corpus, indices y modelos locales
+data/index/
+data/corpus/
+data/reports/
+models/
+*.gguf

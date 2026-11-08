@@ -1,0 +1,12 @@
+# Dependencias del chatbot separadas del agente de medicion.
+#
+# Etapa 2 (procesamiento e indice de Bibliografia):
+# no requiere paquetes de terceros. Usa sqlite3, zlib, re y subprocess de la
+# biblioteca estandar, mas tar.exe del sistema para extraer Ochoa.rar.
+#
+# Etapas posteriores (OCR y modelos locales):
+# pytesseract>=0.3.13
+# Pillow>=10.0
+#
+# Los modelos de Ollama (Qwen2.5 y BGE-M3) se instalan como modelos locales,
+# no como paquetes pip. No se descargan automaticamente en esta etapa.
