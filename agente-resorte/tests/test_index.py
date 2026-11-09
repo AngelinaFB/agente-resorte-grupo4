@@ -80,6 +80,8 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0]["doc_id"], "doc-1")
         self.assertIn("chunk_id", results[0])
+        self.assertIn("needs_ocr", results[0])
+        self.assertIn("quality_flags", results[0])
         self.assertIn("snippet", results[0])
 
     def test_search_filter_page(self):

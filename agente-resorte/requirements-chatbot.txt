@@ -4,9 +4,20 @@
 # no requiere paquetes de terceros. Usa sqlite3, zlib, re y subprocess de la
 # biblioteca estandar, mas tar.exe del sistema para extraer Ochoa.rar.
 #
+# Etapa 3A (embeddings locales BGE-M3 y busqueda semantica/hibrida):
+# - Backend preferente: Ollama local con el modelo bge-m3 instalado.
+#   El modulo usa urllib de la biblioteca estandar para hablar con Ollama;
+#   no requiere cliente HTTP externo.
+# - numpy se usa para similitud coseno sobre vectores almacenados localmente.
+# - sentence-transformers es opcional: solo si se usa backend
+#   sentence_transformers y el modelo BAAI/bge-m3 ya esta en cache local.
+#   No se descargan modelos automaticamente.
+numpy>=1.26
+# sentence-transformers>=3.0  # opcional, backend local si el modelo ya esta cacheado
+#
 # Etapas posteriores (OCR y modelos locales):
 # pytesseract>=0.3.13
 # Pillow>=10.0
 #
 # Los modelos de Ollama (Qwen2.5 y BGE-M3) se instalan como modelos locales,
-# no como paquetes pip. No se descargan automaticamente en esta etapa.
+# no como paquetes pip. No se descargan automaticamente.

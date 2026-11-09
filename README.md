@@ -1,4 +1,9 @@
 # agente-resorte-grupo4
+
+## Agente bibliográfico
+
+El código de búsqueda bibliográfica está en `agente-resorte/chatbot`. Cada integrante prepara sus datos locales desde los PDF fuente; las instrucciones para instalar dependencias, Ollama y BGE-M3 y construir los índices están en [agente-resorte/chatbot/README.md](agente-resorte/chatbot/README.md). En Windows, el flujo completo se inicia con `agente-resorte/setup-chatbot.ps1`.
+
 ## DATOS DE LA ESTRUCTURA GENERAL ##
 
 En `agente-resorte/requirements.txt` están las dependencias:

@@ -162,9 +162,19 @@ def build_index(
         conn.close()
 
 
-def _fts_query(query: str) -> str:
+_SPANISH_STOPWORDS = {
+    "a", "al", "como", "con", "cual", "de", "del", "el", "en", "entre",
+    "es", "esta", "existe", "la", "las", "lo", "los", "mas", "o", "para",
+    "por", "que", "se", "su", "un", "una", "y",
+}
+
+
+def _fts_query(query: str, match_any: bool = False) -> str:
     tokens = re.findall(r"\w+", query, flags=re.UNICODE)
-    return " ".join(f'"{token}"' for token in tokens)
+    if match_any:
+        tokens = [token for token in tokens if token.casefold() not in _SPANISH_STOPWORDS]
+    operator = " OR " if match_any else " "
+    return operator.join(f'"{token}"' for token in tokens)
 
 
 def search(
@@ -173,8 +183,10 @@ def search(
     limit: int = 5,
     doc_id: str | None = None,
     page: int | None = None,
+    match_any: bool = False,
 ) -> list[dict[str, Any]]:
-    fts = _fts_query(query)
+    """Busca texto; ``match_any`` permite una consulta léxica relajada."""
+    fts = _fts_query(query, match_any=match_any)
     if not fts:
         return []
     limit = max(1, min(int(limit), 50))
@@ -196,11 +208,14 @@ def search(
             c.page,
             c.chunk_index,
             c.text,
+            p.needs_ocr,
+            p.quality_flags,
             snippet(chunks_fts, 1, '«', '»', '…', 24) AS snippet,
             bm25(chunks_fts) AS rank
         FROM chunks_fts
         JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
         JOIN documents d ON d.doc_id = c.doc_id
+        JOIN pages p ON p.doc_id = c.doc_id AND p.page = c.page
         WHERE {' AND '.join(where)}
         ORDER BY rank
         LIMIT ?
@@ -221,6 +236,8 @@ def search(
             "text": row["text"],
             "snippet": row["snippet"],
             "score": -float(row["rank"]),
+            "needs_ocr": bool(row["needs_ocr"]),
+            "quality_flags": json.loads(row["quality_flags"]),
         }
         for row in rows
     ]
