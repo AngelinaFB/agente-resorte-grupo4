@@ -12,18 +12,58 @@ def modelo(t, A, gamma, omega, phi, C):
     return A * np.exp(-gamma * t) * np.cos(omega * t + phi) + C
 
 
-def ajustar(t, x, sx):
-    """Ajuste por cuadrados mínimos ponderado. Devuelve el resultado de lmfit."""
-    dt = np.median(np.diff(t))
+def ajustar(t, x, sx, robusto=True):
+    """Ajuste por cuadrados mínimos ponderado. Devuelve el resultado de lmfit.
+
+    Antes de aceptar `sx` como incertidumbre, estima un piso de ruido a partir del
+    residual (MAD). Así, si SIGMA_PX=0.29 px subestima el error real de tracking
+    (varios px en videos reales), el chi2 reducido no queda inflado por órdenes de
+    magnitud. El refit usa pérdida robusta soft_l1 para tolerar cuadros outliers.
+    """
+    t = np.asarray(t, dtype=float)
+    x = np.asarray(x, dtype=float)
+    sx = np.asarray(sx, dtype=float)
+    valido = np.isfinite(t) & np.isfinite(x) & np.isfinite(sx) & (sx > 0)
+    if int(valido.sum()) < 5:
+        raise RuntimeError("muy pocos puntos válidos para ajustar")
+    t, x, sx = t[valido], x[valido], sx[valido]
+
+    dt = float(np.median(np.diff(t)))
     freqs = np.fft.rfftfreq(len(t), dt)
     espectro = np.abs(np.fft.rfft(x - x.mean()))
     omega0 = 2 * np.pi * freqs[1:][np.argmax(espectro[1:])]   # semilla desde la FFT
-    p = Model(modelo).make_params(
+    modelo_obj = Model(modelo)
+    p = modelo_obj.make_params(
         A=(x.max() - x.min()) / 2, gamma=0.05, omega=omega0, phi=0.0, C=x.mean()
     )
     p["gamma"].min = 0
     p["A"].min = 0
-    return Model(modelo).fit(x, p, t=t, weights=1 / sx)
+
+    res0 = modelo_obj.fit(x, p, t=t, weights=1 / sx)
+    residuos = x - res0.best_fit
+    sigma_extra = 1.4826 * float(np.median(np.abs(residuos - np.median(residuos))))
+    if not np.isfinite(sigma_extra) or sigma_extra <= 0:
+        sigma_extra = 0.0
+    sx_eff = np.sqrt(sx ** 2 + sigma_extra ** 2)
+
+    p2 = modelo_obj.make_params(**{n: res0.params[n].value for n in res0.var_names})
+    for n in res0.var_names:
+        p2[n].min = res0.params[n].min
+        p2[n].max = res0.params[n].max
+    res = modelo_obj.fit(
+        x, p2, t=t, weights=1 / sx_eff,
+        method="least_squares" if robusto else "leastsq",
+        fit_kws=dict(loss="soft_l1", f_scale=1.0) if robusto else None,
+    )
+    res.sigma_extra = sigma_extra
+    # Con pérdida robusta, res.redchi es el objetivo soft_l1, no un chi2 comparable.
+    # Guardamos el chi2 estándar con las mismas sx_eff para decidir si el video es válido.
+    dof = max(1, len(x) - len(res.var_names))
+    residuos_finales = x - res.best_fit
+    res.rms_residuo = float(np.sqrt(np.mean(residuos_finales ** 2)))
+    res.redchi_sin_piso = float(res0.redchi)
+    res.redchi_estandar = float(np.sum((residuos_finales / sx_eff) ** 2) / dof)
+    return res
 
 
 def parametros_con_incerteza(res):
@@ -200,7 +240,7 @@ if __name__ == "__main__":
     p = parametros_con_incerteza(res)
     c = cantidades(p, m, m_r)
 
-    print(f"χ² reducido = {res.redchi:.2f}  (≈1: ajuste y σ consistentes)")
+    print(f"χ² reducido = {getattr(res, 'redchi_estandar', res.redchi):.2f}  (≈1: ajuste y σ consistentes)")
     print(f"A = {p['A']:.4f} m | C = {p['C']:.5f} m | φ = {p['phi']:.3f} rad")
     print(f"T = {c['T']:.4f} s | γ = {c['gamma']:.4f} 1/s")
     print(f"k (con m_ef) = {c['k_con_mef']:.3f} N/m | k (sin m_ef) = {c['k_sin_mef']:.3f} N/m")

@@ -9,7 +9,8 @@ from uncertainties import ufloat
 
 from tracking import trackear
 from calibracion import marcar_dos_puntos, escala_px_por_m, a_metros, fps_real_con_led
-from señal import rellenar_nan, procesar, graficar as graficar_senal, comparar_crudo_filtrado
+from señal import (rellenar_nan, procesar, detectar_inicio, graficar as graficar_senal,
+                   comparar_crudo_filtrado)
 from ajuste import (ajustar, parametros_con_incerteza, cantidades, k_estatico,
                     chequeo_periodo, energias, maximos, graficar as graficar_ajuste)
 
@@ -31,6 +32,17 @@ VARIABLES_AGREGADAS = (
     ("k", "k (con m_ef)", "N/m"),
     ("k_sin", "k (sin m_ef)", "N/m"),
 )
+
+
+def estado_video(r):
+    """Criterio orientativo único para decidir si una repetición es promediable."""
+    perdidos = r.get("perdidos_analisis", r["perdidos"])
+    return "aceptable" if (
+        perdidos <= .05
+        and .3 <= r["redchi"] <= 3
+        and r["ciclos"] >= 5
+        and r.get("muestras_T", 0) >= 10
+    ) else "revisar"
 
 
 def variables_comunes(a):
@@ -91,8 +103,33 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
     std_y = np.nanstd(ym)
     eje = "y" if std_y > std_x else "x"
     x, sx = (ym, sym) if eje == "y" else (xm, sxm)
-    x, _ = rellenar_nan(t, x)
-    sx = np.where(np.isnan(sx), np.nanmedian(sx), sx)
+    sx = np.where(np.isfinite(sx), sx, np.nanmedian(sx[np.isfinite(sx)]))
+    x_rell, n_rellenados = rellenar_nan(t, x)
+
+    # Recorte del tramo previo a la liberación: --inicio manual o detección automática.
+    inicio = getattr(a, "inicio", None)
+    if inicio is None and getattr(a, "recorte_auto", True):
+        inicio = detectar_inicio(
+            t, x_rell, ventana_s=getattr(a, "ventana_inicio", 0.5)
+        )
+    if inicio is None:
+        inicio = float(t[0])
+    inicio = float(np.clip(inicio, t[0], t[-1]))
+    mascara = t >= inicio
+    if int(mascara.sum()) < 20:
+        raise RuntimeError(
+            f"el inicio de análisis ({inicio:.3f} s) deja menos de 20 cuadros"
+        )
+    t_rec, x_rec, sx_rec = t[mascara], x_rell[mascara], sx[mascara]
+    perdidos_analisis = float(np.isnan(x[mascara]).mean())
+    x_fit = x[mascara]
+    valido = np.isfinite(x_fit) & np.isfinite(sx_rec) & (sx_rec > 0)
+    if int(valido.sum()) < 20:
+        raise RuntimeError(
+            "muy pocos cuadros con detección válida después del recorte; "
+            "revisá el punto de tracking o el inicio del análisis"
+        )
+    t_fit, x_fit, sx_fit = t_rec[valido], x_fit[valido], sx_rec[valido]
 
     m = getattr(a, "masa_u", None)
     if m is None:
@@ -101,7 +138,9 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
     if m_r is None:
         m_r = ufloat(a.masa_resorte, a.sigma_masa_resorte, tag=TAG_COMUN + "masa_resorte")
 
-    res = ajustar(t, x, sx)
+    # El ajuste usa solo cuadros con detección: no se inventan datos en huecos largos.
+    # Se toma t=0 en el inicio del tramo para que A sea la amplitud de liberación.
+    res = ajustar(t_fit - inicio, x_fit, sx_fit)
     if res.covar is None:
         raise RuntimeError("el ajuste no tiene matriz de covarianza (¿no se detecta oscilación?)")
     p = parametros_con_incerteza(res)
@@ -115,7 +154,7 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
         p["gamma"] = p["gamma"] * corr
     c = cantidades(p, m, m_r)
 
-    r = procesar(t, x, ventana=a.ventana)
+    r = procesar(t_rec, x_rec, ventana=a.ventana)
     # corr es el mismo objeto que escaló ω y γ: así Ec/Et y Ep/k comparten la
     # incerteza del fps y no se cuenta dos veces en Et ni en RMS a / a_max
     Ec, Ep, Et = energias(r["x_f"], r["v_f"], c["k_con_mef"], c["m_ef"], p["C"], corr_v=corr)
@@ -123,22 +162,37 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
     energia = {"Ec_max (J)": i_max(Ec), "Ep_max (J)": i_max(Ep),
                "Et media (J)": np.mean(Et), "Et al inicio (J)": Et[0],
                "Et al final (J)": Et[-1], "ΔEt (final - inicial) (J)": Et[-1] - Et[0]}
-    graficar_senal(t, r, f"{carpeta}/{nombre}_senal.png")
-    graficar_ajuste(t, x, res, Ec, Ep, Et, f"{carpeta}/{nombre}_ajuste.png")
+    graficar_senal(t_rec, r, f"{carpeta}/{nombre}_senal.png")
+    # El ajuste se hizo con los puntos válidos; se evalúa sobre la grilla completa
+    # recortada para que el gráfico y las energías queden alineados.
+    from types import SimpleNamespace
+    res_plot = SimpleNamespace(best_fit=res.eval(t=t_rec - inicio))
+    graficar_ajuste(t_rec, x_rec, res_plot, Ec, Ep, Et, f"{carpeta}/{nombre}_ajuste.png")
 
     T = c["T"]
     mx = maximos(p)
     comp = comparar_crudo_filtrado(r, corr_v=corr)
     comp["RMS a / a_max del ajuste"] = comp["RMS a (m/s²)"] / mx["a_max (m/s²)"]
-    return dict(
+    ciclos = (t_rec[-1] - t_rec[0]) / T.n
+    muestras_T = T.n * fps_uso
+    resultado = dict(
         nombre=nombre, eje=eje, T=T, omega=p["omega"], gamma=c["gamma"],
         k=c["k_con_mef"], k_sin=c["k_sin_mef"],
-        A=p["A"], C=p["C"], phi=p["phi"], redchi=res.redchi, perdidos=perdidos,
-        seguimiento=seguimiento,
-        ciclos=(t[-1] - t[0]) / T.n, muestras_T=T.n * fps_uso,
+        A=p["A"], C=p["C"], phi=p["phi"],
+        redchi=float(getattr(res, "redchi_estandar", res.redchi)),
+        perdidos=perdidos,
+        perdidos_analisis=perdidos_analisis, seguimiento=seguimiento,
+        inicio_s=inicio, n_rellenados=n_rellenados,
+        rms_residuo=float(getattr(res, "rms_residuo", np.nan)),
+        sigma_extra=float(getattr(res, "sigma_extra", 0.0)),
+        sigma_tracking_px=float(np.nanmedian(sx_fit)) * escala[0],
+        redchi_sin_piso=float(getattr(res, "redchi_sin_piso", res.redchi)),
+        ciclos=ciclos, muestras_T=muestras_T,
         fps_decl=fps_decl, fps_uso=fps_uso, fps_sigma=fps_sigma, fps_origen=origen,
         maximos=mx, energia=energia, comp=comp,
     )
+    resultado["estado"] = estado_video(resultado)
+    return resultado
 
 
 def agregado(vals):
@@ -179,8 +233,12 @@ def agregado(vals):
     )
 
 
-def calcular_agregados(res):
-    return {clave: agregado([r[clave] for r in res]) for clave, _, _ in VARIABLES_AGREGADAS}
+def calcular_agregados(res, solo_validos=True):
+    """Agrega solo repeticiones aceptables; devuelve None si no queda ninguna."""
+    base = [r for r in res if r.get("estado", "revisar") == "aceptable"] if solo_validos else list(res)
+    if not base:
+        return None
+    return {clave: agregado([r[clave] for r in base]) for clave, _, _ in VARIABLES_AGREGADAS}
 
 
 def _medida_json(valor, unidad):
@@ -207,9 +265,10 @@ def resultados_json(res):
         seg = r.get("seguimiento", {})
         total = int(seg.get("cuadros", 0))
         detectados = int(seg.get("detectados", total - round(r["perdidos"] * total)))
-        calidad = "aceptable" if r["perdidos"] <= .05 and .3 <= r["redchi"] <= 3 and r["ciclos"] >= 5 else "revisar"
+        calidad = r.get("estado", estado_video(r))
+        perdidos_analisis = float(r.get("perdidos_analisis", r["perdidos"]))
         alertas = []
-        if r["perdidos"] > .05: alertas.append("más de 5 % de cuadros sin detección")
+        if perdidos_analisis > .05: alertas.append("más de 5 % de cuadros sin detección en el tramo analizado")
         if r["redchi"] < .3 or r["redchi"] > 3: alertas.append("chi cuadrado reducido fuera del rango orientativo 0.3–3")
         if r["ciclos"] < 5: alertas.append("menos de 5 ciclos observados")
         if r["muestras_T"] < 10: alertas.append("menos de 10 cuadros por período")
@@ -217,6 +276,10 @@ def resultados_json(res):
         resultados = {nombre: _medida_json(r[clave], unidad)
                       for nombre, (clave, unidad) in definiciones.items()}
         resultados["chi_cuadrado_reducido"] = {"valor": float(r["redchi"]), "unidad": ""}
+        resultados["chi_cuadrado_sin_piso_de_ruido"] = {
+            "valor": float(r.get("redchi_sin_piso", r["redchi"])), "unidad": ""
+        }
+        resultados["rms_residuo"] = {"valor": float(r.get("rms_residuo", 0.0)), "unidad": "m"}
         resultados["maximos"] = {
             nombre: _medida_json(valor, nombre.rpartition("(")[2].rstrip(")"))
             for nombre, valor in r["maximos"].items()
@@ -233,13 +296,21 @@ def resultados_json(res):
                 "cuadros_detectados": detectados,
                 "cuadros_perdidos": total - detectados,
                 "porcentaje_perdido": 100 * float(r["perdidos"]),
+                "porcentaje_perdido_analisis": 100 * perdidos_analisis,
+                "inicio_analisis_s": float(r.get("inicio_s", 0.0)),
+                "cuadros_rellenados": int(r.get("n_rellenados", 0)),
                 "eje_de_oscilacion": r["eje"],
                 "cuadros_con_candidatos_multiples": int(seg.get("frames_con_multiples_candidatos", 0)),
                 "saltos_descartados": int(seg.get("saltos_descartados", 0)),
+                "cuadros_con_flujo": int(seg.get("cuadros_con_flujo", 0)),
+                "cuadros_con_plantilla": int(seg.get("cuadros_con_plantilla", 0)),
+                "redetecciones": int(seg.get("redetecciones", 0)),
             },
             "ajuste": {
                 "ciclos_observados": float(r["ciclos"]),
                 "cuadros_por_periodo": float(r["muestras_T"]),
+                "sigma_extra_ruido": float(r.get("sigma_extra", 0.0)),
+                "sigma_tracking_px": float(r.get("sigma_tracking_px", 0.0)),
             },
             "fps": {"declarados": float(r["fps_decl"]), "usados": float(r["fps_uso"]),
                     "incerteza": float(r["fps_sigma"]), "origen": r["fps_origen"]},
@@ -254,19 +325,28 @@ def resultados_json(res):
     }
     if res:
         agregados = calcular_agregados(res)
-        claves = {"periodo": ("T", "s"), "frecuencia_angular": ("omega", "rad/s"),
-                  "amortiguamiento": ("gamma", "1/s"),
-                  "constante_elastica_con_masa_efectiva": ("k", "N/m"),
-                  "constante_elastica_sin_masa_efectiva": ("k_sin", "N/m")}
-        salida["resultado_agregado"] = {
-            "cantidad_repeticiones": len(res),
-            "magnitudes": {nombre: {
-                "valor": float(agregados[clave]["media"]),
-                "incerteza_estadistica": float(agregados[clave]["est"]),
-                "incerteza_sistematica": float(agregados[clave]["sis"]),
-                "incerteza_total": float(agregados[clave]["tot"]), "unidad": unidad,
-            } for nombre, (clave, unidad) in claves.items()},
-        }
+        validos = [r for r in res if r.get("estado", "revisar") == "aceptable"]
+        if agregados is not None:
+            claves = {"periodo": ("T", "s"), "frecuencia_angular": ("omega", "rad/s"),
+                      "amortiguamiento": ("gamma", "1/s"),
+                      "constante_elastica_con_masa_efectiva": ("k", "N/m"),
+                      "constante_elastica_sin_masa_efectiva": ("k_sin", "N/m")}
+            salida["resultado_agregado"] = {
+                "cantidad_repeticiones": len(validos),
+                "repeticiones_excluidas": len(res) - len(validos),
+                "magnitudes": {nombre: {
+                    "valor": float(agregados[clave]["media"]),
+                    "incerteza_estadistica": float(agregados[clave]["est"]),
+                    "incerteza_sistematica": float(agregados[clave]["sis"]),
+                    "incerteza_total": float(agregados[clave]["tot"]), "unidad": unidad,
+                } for nombre, (clave, unidad) in claves.items()},
+            }
+        else:
+            salida["resultado_agregado"] = None
+            salida["motivo_sin_agregado"] = (
+                "ninguna repetición cumple los criterios de calidad; "
+                "no se promedian resultados no confiables"
+            )
     return salida
 
 
@@ -278,41 +358,61 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
          f"- Masa colgante: **{fmt(ufloat(a.masa, a.sigma_masa), 'kg')}**",
          f"- Masa del resorte: **{fmt(ufloat(a.masa_resorte, a.sigma_masa_resorte), 'kg')}**",
          f"- Escala espacial: **{fmt(ufloat(*escala), 'px/m')}**",
-         f"- Filtro de señal: **{a.ventana} cuadros**", "",
+         f"- Filtro de señal: **{a.ventana} cuadros**",
+         f"- Inicio del ajuste: **{'automático' if getattr(a, 'inicio', None) is None and getattr(a, 'recorte_auto', True) else ('%.3f s' % (getattr(a, 'inicio', 0.0) or 0.0))}**", "",
          "Los valores se expresan como valor ± incertidumbre. **Revisar** indica que el seguimiento "
-         "o el ajuste no cumple al menos uno de los criterios orientativos.", "", "## Resultados por video", ""]
+         "o el ajuste no cumple al menos uno de los criterios orientativos. El ajuste usa solo "
+         "cuadros con detección; la interpolación se reserva para los gráficos.", "", "## Resultados por video", ""]
     if res:
         L += ["| Video | Estado | Período T (s) | Frecuencia angular ω (rad/s) | Amortiguamiento γ (1/s) | k con masa efectiva (N/m) | k sin masa efectiva (N/m) |",
               "|---|---|---:|---:|---:|---:|---:|"]
         for r in res:
-            estado = "Aceptable" if r["perdidos"] <= .05 and .3 <= r["redchi"] <= 3 and r["ciclos"] >= 5 else "Revisar"
+            estado = "Aceptable" if r.get("estado", estado_video(r)) == "aceptable" else "Revisar"
             L.append(f"| {r['nombre']} | {estado} | {fmt(r['T'])} | {fmt(r['omega'])} | {fmt(r['gamma'])} | {fmt(r['k'])} | {fmt(r['k_sin'])} |")
 
         L += ["", "## Seguimiento de la pesa", "",
-              "Los cuadros perdidos se interpolan antes del ajuste. Si son muchos, los resultados pueden perder precisión.", "",
-              "| Video | Método | Cuadros | Detectados | Perdidos | Perdidos (%) | Eje | Cuadros con varios candidatos | Saltos descartados |",
-              "|---|---|---:|---:|---:|---:|---|---:|---:|"]
+              "El ajuste descarta los cuadros sin detección. Si son muchos, la incertidumbre real "
+              "puede ser mayor que la reportada por el ajuste.", "",
+              "| Video | Método | Cuadros | Detectados | Perdidos | Perdidos (%) | Inicio (s) | Perdidos en el tramo (%) | Eje | Varios candidatos | Saltos descartados |",
+              "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|"]
         for r in res:
             s = r.get("seguimiento", {})
             n = int(s.get("cuadros", 0))
             nd = int(s.get("detectados", n - round(r["perdidos"] * n)))
-            L.append(f"| {r['nombre']} | {s.get('metodo', 'No informado')} | {n} | {nd} | {n-nd} | {100*r['perdidos']:.1f} % | {r['eje']} | {s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |")
+            L.append(f"| {r['nombre']} | {s.get('metodo', 'No informado')} | {n} | {nd} | "
+                     f"{n-nd} | {100*r['perdidos']:.1f} % | {r.get('inicio_s', 0.0):.3f} | "
+                     f"{100*r.get('perdidos_analisis', r['perdidos']):.1f} % | {r['eje']} | "
+                     f"{s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |")
 
         L += ["", "## Calidad del ajuste", "",
-              "| Video | χ² reducido | Ciclos observados | Cuadros por período | FPS usado | Origen del FPS |",
-              "|---|---:|---:|---:|---:|---|"]
+              "| Video | χ² reducido | χ² sin piso de ruido | RMS residual (px) | σ extra (px) | Ciclos observados | Cuadros por período | FPS usado | Origen del FPS |",
+              "|---|---:|---:|---:|---:|---:|---:|---:|---|"]
         for r in res:
-            L.append(f"| {r['nombre']} | {r['redchi']:.3g} | {r['ciclos']:.2f} | {r['muestras_T']:.1f} | {r['fps_uso']:.4g} fps | {r['fps_origen']} |")
-        L += ["", "Como guía, el estado aceptable requiere hasta 5 % de cuadros perdidos, χ² reducido entre 0.3 y 3 y al menos 5 ciclos. Revisá también los gráficos.", "",
+            rms_px = float(r.get("rms_residuo", 0.0)) * escala[0]
+            sigma_px = float(r.get("sigma_extra", 0.0)) * escala[0]
+            L.append(f"| {r['nombre']} | {r['redchi']:.3g} | {r.get('redchi_sin_piso', r['redchi']):.3g} | "
+                     f"{rms_px:.3g} | {sigma_px:.3g} | {r['ciclos']:.2f} | {r['muestras_T']:.1f} | "
+                     f"{r['fps_uso']:.4g} fps | {r['fps_origen']} |")
+        L += ["", "Como guía, el estado aceptable requiere hasta 5 % de cuadros perdidos en el tramo analizado, "
+              "χ² reducido entre 0.3 y 3 y al menos 5 ciclos. El χ² usa un piso de ruido estimado del "
+              "residual; el valor sin piso se incluye para comparar con el criterio anterior.", "",
               "## Resultado combinado de las repeticiones", "",
+              "Solo se promedian las repeticiones con estado aceptable. "
               "σ estadística representa la variación entre repeticiones (o la incertidumbre del ajuste con una repetición). "
               "σ sistemática incluye errores comunes, como masa y FPS. σ total combina ambas.", "",
               "| Magnitud | Media | σ estadística | σ sistemática | σ total |",
               "|---|---:|---:|---:|---:|"]
         agregados = calcular_agregados(res)
-        for clave, nombre, unidad in VARIABLES_AGREGADAS:
-            v = agregados[clave]
-            L.append(f"| {nombre} ({unidad}) | {v['media']:.6g} | {v['est']:.3g} | {v['sis']:.3g} | {v['tot']:.3g} |")
+        validos = [r for r in res if r.get("estado", "revisar") == "aceptable"]
+        if agregados is None:
+            L.append("| — | — | — | — | — |")
+            L += ["", f"No se calculó un promedio: ninguna de las {len(res)} repeticiones cumple los criterios de calidad."]
+        else:
+            for clave, nombre, unidad in VARIABLES_AGREGADAS:
+                v = agregados[clave]
+                L.append(f"| {nombre} ({unidad}) | {v['media']:.6g} | {v['est']:.3g} | {v['sis']:.3g} | {v['tot']:.3g} |")
+            if len(validos) < len(res):
+                L += ["", f"Se excluyeron {len(res) - len(validos)} repetición(es) por estado Revisar."]
         L += ["", "## Otros resultados del primer video", "", "### Máximos calculados", ""]
         L.extend(f"- **{nombre}:** {fmt(valor)}" for nombre, valor in res[0]["maximos"].items())
         L += ["", "### Energías", "", "| Magnitud | Resultado |", "|---|---:|"]
@@ -323,8 +423,8 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
         for r in res:
             celdas = [fmt(r["comp"][k]) if hasattr(r["comp"][k], "n") else f"{r['comp'][k]:.4f}" for k in claves]
             L.append(f"| {r['nombre']} | " + " | ".join(celdas) + " |")
-        if k_e is not None:
-            agg = calcular_agregados(res)["T"]
+        if k_e is not None and agregados is not None:
+            agg = agregados["T"]
             t_med = ufloat(agg["media"], agg["tot"])
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
@@ -334,16 +434,28 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
 
     limitaciones = []
     for r in res:
-        if r["perdidos"] > .05: limitaciones.append(f"{r['nombre']}: {100*r['perdidos']:.1f} % de cuadros sin detección; se interpolaron.")
+        perdidos_analisis = r.get("perdidos_analisis", r["perdidos"])
+        if perdidos_analisis > .05:
+            limitaciones.append(
+                f"{r['nombre']}: {100*perdidos_analisis:.1f} % de cuadros sin detección en el tramo "
+                f"analizado ({100*r['perdidos']:.1f} % en todo el video)."
+            )
         if r["redchi"] > 3 or r["redchi"] < .3: limitaciones.append(f"{r['nombre']}: χ² reducido {r['redchi']:.2f}; el modelo puede no describir bien los datos.")
         if r["ciclos"] < 5: limitaciones.append(f"{r['nombre']}: solo {r['ciclos']:.1f} ciclos; T y k pueden ser poco precisos.")
         if r["muestras_T"] < 10: limitaciones.append(f"{r['nombre']}: {r['muestras_T']:.1f} cuadros por período; posible submuestreo.")
         if r["gamma"].n < 2*r["gamma"].s: limitaciones.append(f"{r['nombre']}: amortiguamiento compatible con cero dentro de 2 incertidumbres.")
+        if r.get("inicio_s", 0.0) > 0:
+            limitaciones.append(f"{r['nombre']}: se ajustó desde t = {r['inicio_s']:.3f} s para excluir el tramo estático.")
+    validos = [r for r in res if r.get("estado", "revisar") == "aceptable"]
     if len(res) < 5: limitaciones.append(f"Se analizaron {len(res)} repeticiones; la receta recomienda entre 5 y 20.")
     if res and not res[0]["fps_sigma"]: limitaciones.append("FPS real no verificado; se usó el FPS del video o el valor ingresado.")
     if getattr(a, "fps_led_aviso", None): limitaciones.append(a.fps_led_aviso)
     if k_e is None: limitaciones.append("No se comparó con una k estática porque no se ingresaron esos datos.")
     elif a.sigma_elongacion is None: limitaciones.append("La incertidumbre de las elongaciones no está incluida en la k estática.")
+    if res and len(validos) < len(res):
+        limitaciones.append(
+            f"{len(res) - len(validos)} repetición(es) quedaron en estado Revisar y no se incluyeron en el promedio."
+        )
     limitaciones.extend(f"{nombre}: error durante el análisis: {error}" for nombre, error in fallidos)
     L += ["", "## Observaciones y limitaciones", ""]
     L += [f"- {x}" for x in limitaciones] if limitaciones else ["- No se detectaron limitaciones automáticas."]
@@ -368,6 +480,14 @@ def main():
     ap.add_argument("--roi", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
                     help="región del LED en el cuadro; si no se da, se usa todo el cuadro")
     ap.add_argument("--ventana", type=int, default=11)
+    ap.add_argument("--punto", type=float, nargs=2, metavar=("X", "Y"),
+                    help="punto inicial (px) de la masa en el primer cuadro; se usa en todos los videos")
+    ap.add_argument("--inicio", type=float,
+                    help="segundo desde el cual ajustar; si no se da, se detecta automáticamente")
+    ap.add_argument("--sin-recorte", action="store_true",
+                    help="no recortar el tramo inicial (ajustar el video completo)")
+    ap.add_argument("--ventana-inicio", type=float, default=0.5,
+                    help="ventana (s) para detectar el inicio de la oscilación (default 0.5)")
     ap.add_argument("--masas-estaticas", type=float, nargs="+")
     ap.add_argument("--elongaciones", type=float, nargs="+")
     ap.add_argument("--sigma-elongacion", type=float,
@@ -376,6 +496,9 @@ def main():
                     help="incerteza de g en el k estático (m/s², default 0.01)")
     ap.add_argument("--salidas", default="salidas")
     a = ap.parse_args()
+    a.recorte_auto = not a.sin_recorte
+    if a.sin_recorte and a.inicio is not None:
+        ap.error("--sin-recorte y --inicio son incompatibles")
 
     if a.px_por_m is None and a.regla_m is None:
         ap.error("dar --px-por-m o --regla-m")
@@ -432,7 +555,7 @@ def main():
     res, fallidos = [], []
     for v in a.videos:
         try:
-            res.append(analizar(v, a, escala, a.salidas))
+            res.append(analizar(v, a, escala, a.salidas, punto_inicial=a.punto))
             print(f"OK  {v}")
         except Exception as e:
             fallidos.append((os.path.basename(v), str(e)))

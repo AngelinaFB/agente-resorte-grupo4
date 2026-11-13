@@ -20,6 +20,50 @@ def rellenar_nan(t, x):
     return x, int(malos.sum())
 
 
+def detectar_inicio(t, x, ventana_s=0.5, umbral=0.15):
+    """Segundo en que comienza la oscilación, para no ajustar el tramo estático.
+
+    Usa una ventana causal (solo cuadros pasados) para no mirar hacia adelante y
+    busca el primer tramo sostenido que supera `umbral` veces el desvío máximo.
+    Si no hay un prefijo quieto, devuelve el inicio del registro (t[0]).
+    """
+    t = np.asarray(t, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if len(t) < 5 or len(x) != len(t):
+        return float(t[0]) if len(t) else 0.0
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        return float(t[0])
+    n_ventana = max(5, int(round(ventana_s / dt)))
+    n_ventana = min(n_ventana, len(x))
+
+    # Media y desvío de una ventana causal: en i solo se usan x[0..i].
+    kernel = np.ones(n_ventana) / n_ventana
+    pad = np.pad(x, (n_ventana - 1, 0), mode="edge")
+    media = np.convolve(pad, kernel, mode="valid")
+    pad2 = np.pad(x ** 2, (n_ventana - 1, 0), mode="edge")
+    media2 = np.convolve(pad2, kernel, mode="valid")
+    desvio = np.sqrt(np.maximum(media2 - media ** 2, 0.0))
+
+    max_desvio = float(np.nanmax(desvio))
+    if not np.isfinite(max_desvio) or max_desvio <= 0:
+        return float(t[0])
+    sobre = desvio > umbral * max_desvio
+    corrida = 0
+    for indice, activo in enumerate(sobre):
+        corrida = corrida + 1 if activo else 0
+        if corrida >= n_ventana:
+            inicio = indice - n_ventana + 1
+            # Si la señal ya oscilaba desde el primer cuadro, el arranque de la
+            # ventana causal pierde el primer semiciclo: se retrocede un poco.
+            # Con un prefijo quieto real no se retrocede para no meter cuadros
+            # estáticos que inflan el chi2.
+            if inicio < n_ventana:
+                inicio = max(0, inicio - max(1, n_ventana // 4))
+            return float(t[inicio])
+    return float(t[0])
+
+
 def derivar(t, y):
     """Diferencias finitas centrales (np.gradient)."""
     return np.gradient(y, t)
