@@ -247,8 +247,8 @@ def trackear(
         "saltos_descartados": descartados,
         "frames_con_multiples_candidatos": multiples,
         "metodo": (
-            "punto seleccionado (flujo optico)"
-            if punto_inicial is not None else "movimiento"
+            "punto seleccionado (flujo óptico)"
+            if punto_inicial is not None else "MOG2 (detección de movimiento)"
         ),
     }
     tabla.resumen = resumen

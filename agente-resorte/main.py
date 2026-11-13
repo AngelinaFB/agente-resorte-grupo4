@@ -228,6 +228,7 @@ def resultados_json(res):
             "estado": calidad,
             "alertas": alertas,
             "seguimiento": {
+                "metodo": seg.get("metodo", "No informado"),
                 "cuadros_totales": total,
                 "cuadros_detectados": detectados,
                 "cuadros_perdidos": total - detectados,
@@ -289,13 +290,13 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
 
         L += ["", "## Seguimiento de la pesa", "",
               "Los cuadros perdidos se interpolan antes del ajuste. Si son muchos, los resultados pueden perder precisión.", "",
-              "| Video | Cuadros | Detectados | Perdidos | Perdidos (%) | Eje | Cuadros con varios candidatos | Saltos descartados |",
-              "|---|---:|---:|---:|---:|---|---:|---:|"]
+              "| Video | Método | Cuadros | Detectados | Perdidos | Perdidos (%) | Eje | Cuadros con varios candidatos | Saltos descartados |",
+              "|---|---|---:|---:|---:|---:|---|---:|---:|"]
         for r in res:
             s = r.get("seguimiento", {})
             n = int(s.get("cuadros", 0))
             nd = int(s.get("detectados", n - round(r["perdidos"] * n)))
-            L.append(f"| {r['nombre']} | {n} | {nd} | {n-nd} | {100*r['perdidos']:.1f} % | {r['eje']} | {s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |")
+            L.append(f"| {r['nombre']} | {s.get('metodo', 'No informado')} | {n} | {nd} | {n-nd} | {100*r['perdidos']:.1f} % | {r['eje']} | {s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |")
 
         L += ["", "## Calidad del ajuste", "",
               "| Video | χ² reducido | Ciclos observados | Cuadros por período | FPS usado | Origen del FPS |",

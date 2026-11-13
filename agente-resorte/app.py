@@ -6,22 +6,30 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
-import cv2
-import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 
-from calibracion import escala_px_por_m
-from main import analizar, escribir_informe, resultados_json, variables_comunes
-from ajuste import k_estatico
-from tracking import trackear
+st.set_page_config(page_title="Análisis de resorte", page_icon="🌀", layout="wide")
+st.title("Análisis de movimiento de un resorte")
+st.write(
+    "Subí uno o varios videos del experimento, completá los datos y ejecutá el análisis. "
+    "Los videos se procesan en una carpeta temporal y no se guardan en el repositorio."
+)
+
+with st.spinner("Cargando herramientas del analizador…", show_time=True):
+    import cv2
+    import numpy as np
+    import streamlit.components.v1 as components
+
+    from calibracion import escala_px_por_m
+    from main import analizar, escribir_informe, resultados_json, variables_comunes
+    from ajuste import k_estatico
+    from tracking import trackear
 
 seleccionar_punto_tracking = components.declare_component(
     "selector_punto_tracking",
     path=str(Path(__file__).parent / "selector_punto_tracking"),
 )
 
-st.set_page_config(page_title="Análisis de resorte", page_icon="🌀", layout="wide")
 if "analisis_ocupado" not in st.session_state:
     st.session_state.analisis_ocupado = False
 st.markdown(
@@ -35,13 +43,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.title("Análisis de movimiento de un resorte")
-st.write(
-    "Subí uno o varios videos del experimento, completá los datos y ejecutá el análisis. "
-    "Los videos se procesan en una carpeta temporal y no se guardan en el repositorio."
-)
-
-
 def leer_lista(texto, nombre):
     if not texto.strip():
         return None
@@ -49,6 +50,10 @@ def leer_lista(texto, nombre):
         return [float(valor.strip()) for valor in texto.split(",") if valor.strip()]
     except ValueError as exc:
         raise ValueError(f"{nombre}: ingresá números separados por comas.") from exc
+
+
+METODO_PUNTO = "Punto marcado · flujo óptico"
+METODO_MOG2 = "MOG2 · detección de movimiento"
 
 
 @st.cache_data(show_spinner=False)
@@ -67,7 +72,7 @@ def primer_cuadro_video(contenido, nombre):
 
 
 def crear_video_tracking(contenido, nombre, punto_inicial, progreso=None):
-    """Genera una copia del video con el punto seleccionado resaltado."""
+    """Genera una previsualización del seguimiento elegido sobre el video."""
     with tempfile.TemporaryDirectory(prefix="resorte-tracking-") as temp_dir:
         ruta_video = Path(temp_dir) / Path(nombre).name
         ruta_salida = Path(temp_dir) / "tracking.mp4"
@@ -120,6 +125,8 @@ videos = st.file_uploader(
 
 frame_size = None
 punto_tracking = None
+metodo_tracking = None
+usar_punto_tracking = False
 if videos:
     frame_preview, frame_size = primer_cuadro_video(videos[0].getvalue(), videos[0].name)
     if frame_preview is None:
@@ -130,6 +137,18 @@ if videos:
 
 if videos:
     firma_videos = tuple((video.file_id, video.name) for video in videos)
+    metodo_tracking = st.segmented_control(
+        "Método de seguimiento",
+        options=[METODO_PUNTO, METODO_MOG2],
+        default=METODO_PUNTO,
+        required=True,
+        key="metodo_tracking",
+        help="El punto marcado sigue rasgos alrededor del clic. MOG2 detecta movimiento en el cuadro completo.",
+    )
+    usar_punto_tracking = metodo_tracking == METODO_PUNTO
+    algoritmo_tracking = (
+        "punto-inicial-flujo-optico-v5" if usar_punto_tracking else "mog2-v1"
+    )
     col_video, col_boton = st.columns([3, 1])
     indice_tracking = col_video.selectbox(
         "Video para revisar",
@@ -143,8 +162,8 @@ if videos:
     )
     clave_punto = f"punto_tracking_{video_seleccionado.file_id}"
     if cuadro_tracking is None or tamano_tracking is None:
-        st.error("No se pudo leer el primer cuadro del video para seleccionar la masa.")
-    else:
+        st.error("No se pudo leer el primer cuadro del video para preparar el seguimiento.")
+    elif usar_punto_tracking:
         st.caption(
             "Hacé clic en el punto exacto de la masa en el primer cuadro. "
             "El seguimiento arranca en ese píxel y continúa por flujo óptico, sin buscar el color rojo."
@@ -184,11 +203,16 @@ if videos:
             )
         else:
             st.info("Seleccioná el punto inicial de la masa para habilitar el tracking.")
+    else:
+        st.caption(
+            "MOG2 detecta las regiones que se mueven en el cuadro completo. "
+            "No hace falta marcar la masa."
+        )
 
     if col_boton.button(
-        "Ver tracking de la masa",
+        "Ver seguimiento",
         type="secondary",
-        disabled=punto_tracking is None,
+        disabled=usar_punto_tracking and punto_tracking is None,
     ):
         barra_tracking = st.progress(0, text="Preparando la vista del tracking…")
 
@@ -205,19 +229,20 @@ if videos:
                 )
 
         try:
-            with st.spinner("Siguiendo el punto seleccionado y preparando la vista…"):
+            with st.spinner("Siguiendo la masa y preparando la vista…"):
                 video_tracking, resumen_tracking = crear_video_tracking(
                     video_seleccionado.getvalue(),
                     video_seleccionado.name,
-                    punto_inicial=punto_tracking,
+                    punto_inicial=(punto_tracking if usar_punto_tracking else None),
                     progreso=actualizar_progreso_tracking,
                 )
             st.session_state["vista_tracking"] = {
                 "firma": firma_videos,
                 "indice": indice_tracking,
                 "formato": "mp4",
-                "algoritmo": "punto-inicial-flujo-optico-v5",
-                "punto_inicial": punto_tracking,
+                "algoritmo": algoritmo_tracking,
+                "metodo_tracking": metodo_tracking,
+                "punto_inicial": punto_tracking if usar_punto_tracking else None,
                 "video": video_tracking,
                 "resumen": resumen_tracking,
             }
@@ -232,22 +257,23 @@ if videos:
         and vista_tracking["firma"] == firma_videos
         and vista_tracking["indice"] == indice_tracking
         and vista_tracking.get("formato") == "mp4"
-        and vista_tracking.get("algoritmo") == "punto-inicial-flujo-optico-v5"
-        and vista_tracking.get("punto_inicial") == punto_tracking
+        and vista_tracking.get("algoritmo") == algoritmo_tracking
+        and vista_tracking.get("metodo_tracking") == metodo_tracking
+        and vista_tracking.get("punto_inicial") == (punto_tracking if usar_punto_tracking else None)
     ):
         resumen = vista_tracking["resumen"]
         st.video(vista_tracking["video"], format="video/mp4")
         st.caption(
-            f"Método: {resumen['metodo']} · "
+            f"Método: {metodo_tracking} · "
             f"Detecciones: {resumen['detectados']}/{resumen['cuadros']} cuadros · "
             f"Sin detección: {resumen['perdidos']} · "
             f"Saltos descartados: {resumen['saltos_descartados']}. "
-            "El círculo verde marca el punto seleccionado; rojo indica un cuadro perdido."
+            "El círculo verde marca la posición seguida; rojo indica un cuadro perdido."
         )
         if resumen["cuadros"] and resumen["perdidos"] / resumen["cuadros"] > 0.05:
             st.warning(
-                "Se perdió más del 5 % del seguimiento. Revisá que el punto seleccionado "
-                "se vea con nitidez y que la masa no quede oculta."
+                "Se perdió más del 5 % del seguimiento. Revisá el método elegido, "
+                "la visibilidad de la masa y posibles oclusiones."
             )
 
 st.subheader("Datos del experimento")
@@ -329,13 +355,14 @@ with st.form("parametros_analisis"):
         type="primary",
         disabled=(
             not videos
-            or punto_tracking is None
+            or (usar_punto_tracking and punto_tracking is None)
             or st.session_state.analisis_ocupado
         ),
     )
 
 firma = (
     tuple((video.file_id, video.name) for video in videos) if videos else (),
+    metodo_tracking if videos else None,
     masa,
     sigma_masa,
     masa_resorte,
@@ -358,7 +385,7 @@ if ejecutar and not st.session_state.analisis_ocupado:
 if st.session_state.analisis_ocupado:
     if not videos:
         st.session_state["error_analisis"] = "Cargá al menos un video."
-    elif punto_tracking is None:
+    elif usar_punto_tracking and punto_tracking is None:
         st.session_state["error_analisis"] = "Hacé clic en el punto de la masa antes de analizar."
     elif not frame_size or puntos is None:
         st.session_state["error_analisis"] = "No se pudo leer el primer cuadro para calibrar la regla. Revisá el video."
@@ -442,7 +469,7 @@ if st.session_state.analisis_ocupado:
                             escala,
                             str(salidas_dir),
                             progreso=actualizar_progreso,
-                            punto_inicial=punto_tracking,
+                            punto_inicial=(punto_tracking if usar_punto_tracking else None),
                         ))
                     except Exception as exc:
                         fallidos.append((Path(ruta).name, str(exc)))
@@ -507,6 +534,7 @@ if analisis and analisis["firma"] == firma:
             filas_resumen.append({
                 "Video": video["video"],
                 "Estado": "Revisar" if video["estado"] == "revisar" else "Aceptable",
+                "Método": seg.get("metodo", "No informado"),
                 "Seguimiento": f"{seg['cuadros_detectados']}/{seg['cuadros_totales']} cuadros",
                 "Período T": mostrar("periodo"),
                 "Frecuencia angular ω": mostrar("frecuencia_angular"),
