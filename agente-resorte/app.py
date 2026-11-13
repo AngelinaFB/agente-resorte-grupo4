@@ -128,6 +128,7 @@ if videos:
         st.caption(f"Cuadro de referencia ({frame_size[0]} × {frame_size[1]} px)")
         st.image(frame_preview, width=520)
 
+sin_punto_propio = []
 if videos:
     firma_videos = tuple((video.file_id, video.name) for video in videos)
     col_video, col_boton = st.columns([3, 1])
@@ -184,6 +185,17 @@ if videos:
             )
         else:
             st.info("Seleccioná el punto inicial de la masa para habilitar el tracking.")
+
+    sin_punto_propio = [
+        video.name for video in videos
+        if not isinstance(st.session_state.get(f"punto_tracking_{video.file_id}"), dict)
+    ]
+    if sin_punto_propio:
+        st.warning(
+            "Estos videos no tienen un punto propio y usarán el punto del video seleccionado: "
+            + ", ".join(sin_punto_propio)
+            + ". Para mejorar la precisión, elegí el punto de la masa en cada video."
+        )
 
     if col_boton.button(
         "Ver tracking de la masa",
@@ -336,6 +348,10 @@ with st.form("parametros_analisis"):
 
 firma = (
     tuple((video.file_id, video.name) for video in videos) if videos else (),
+    tuple(
+        (video.file_id, st.session_state.get(f"punto_tracking_{video.file_id}"))
+        for video in videos
+    ) if videos else (),
     masa,
     sigma_masa,
     masa_resorte,
@@ -347,7 +363,7 @@ firma = (
     elongaciones_texto,
     usar_sigma_elongacion,
     sigma_elongacion if usar_sigma_elongacion else None,
-    punto_tracking,
+    punto_tracking if sin_punto_propio else None,
 )
 
 if ejecutar and not st.session_state.analisis_ocupado:
@@ -389,6 +405,9 @@ if st.session_state.analisis_ocupado:
                 f_led=None,
                 fps_real=None,
                 ventana=ventana,
+                inicio=None,
+                recorte_auto=True,
+                ventana_inicio=0.5,
                 sigma_g=0.01,
                 sigma_elongacion=sigma_elongacion if usar_sigma_elongacion else None,
                 masas_estaticas=masas_estaticas,
@@ -424,6 +443,12 @@ if st.session_state.analisis_ocupado:
                 fallidos = []
                 for index, ruta in enumerate(rutas):
                     estado_progreso.info(f"Analizando video {index + 1} de {len(rutas)}: {Path(ruta).name}")
+                    video_actual = videos[index]
+                    guardado = st.session_state.get(f"punto_tracking_{video_actual.file_id}")
+                    if isinstance(guardado, dict):
+                        punto_video = (guardado["x"], guardado["y"])
+                    else:
+                        punto_video = punto_tracking
 
                     def actualizar_progreso(actual, total, indice=index, cantidad=len(rutas)):
                         if total:
@@ -442,7 +467,7 @@ if st.session_state.analisis_ocupado:
                             escala,
                             str(salidas_dir),
                             progreso=actualizar_progreso,
-                            punto_inicial=punto_tracking,
+                            punto_inicial=punto_video,
                         ))
                     except Exception as exc:
                         fallidos.append((Path(ruta).name, str(exc)))

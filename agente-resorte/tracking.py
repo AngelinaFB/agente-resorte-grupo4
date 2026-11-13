@@ -13,6 +13,15 @@ SALTO_INICIAL_PX = 60.0
 SALTO_N_MEDIANA = 15
 SALTO_MIN_MUESTRAS = 5
 
+RADIO_PLANTILLA = 24
+RADIO_BUSQUEDA_MIN = 60
+RADIO_BUSQUEDA_MAX = 180
+UMBRAL_PLANTILLA = 0.55
+UMBRAL_ACTUALIZAR = 0.85
+ACTUALIZAR_PLANTILLA_CADA = 30
+PERDIDOS_PARA_AMPLIAR = 3
+DISCREPANCIA_FLUJO_PX = 8.0
+
 
 class TablaTracking(np.ndarray):
     """Array (N, 5) del tracking; el resumen queda en el atributo `.resumen`."""
@@ -58,6 +67,57 @@ def _puntos_opticos(gray, punto, radio=18):
     return np.concatenate((ancla, encontrados.astype(np.float32)), axis=0)
 
 
+def _parche(gray, centro, radio):
+    """Recorta un parche cuadrado alrededor de centro. Devuelve (parche, origen)."""
+    alto, ancho = gray.shape
+    x = int(round(centro[0]))
+    y = int(round(centro[1]))
+    x0, y0 = max(0, x - radio), max(0, y - radio)
+    x1, y1 = min(ancho, x + radio + 1), min(alto, y + radio + 1)
+    if x1 - x0 < 5 or y1 - y0 < 5:
+        return None, None
+    return gray[y0:y1, x0:x1].copy(), (x0, y0)
+
+
+def _subpixel(res, loc):
+    """Ajuste parabólico del máximo de matchTemplate para precisión subpíxel."""
+    x, y = loc
+
+    def parab(v0, v1, v2):
+        den = v0 - 2 * v1 + v2
+        if abs(den) < 1e-12:
+            return 0.0
+        return float(np.clip(0.5 * (v0 - v2) / den, -0.5, 0.5))
+
+    dx = parab(res[y, x - 1], res[y, x], res[y, x + 1]) if 0 < x < res.shape[1] - 1 else 0.0
+    dy = parab(res[y - 1, x], res[y, x], res[y + 1, x]) if 0 < y < res.shape[0] - 1 else 0.0
+    return dx, dy
+
+
+def _match_plantilla(gray, plantilla, centro, radio):
+    """Busca la plantilla en una ventana alrededor de centro.
+
+    Devuelve ((x, y), score) con centro subpíxel de la mejor coincidencia.
+    """
+    alto, ancho = gray.shape
+    ph, pw = plantilla.shape[:2]
+    x0 = max(0, int(round(centro[0])) - radio)
+    y0 = max(0, int(round(centro[1])) - radio)
+    x1 = min(ancho, int(round(centro[0])) + radio + 1)
+    y1 = min(alto, int(round(centro[1])) + radio + 1)
+    roi = gray[y0:y1, x0:x1]
+    if roi.shape[0] < ph or roi.shape[1] < pw:
+        return None, 0.0
+    res = cv2.matchTemplate(roi, plantilla, cv2.TM_CCOEFF_NORMED)
+    _, max_val, _, max_loc = cv2.minMaxLoc(res)
+    if not np.isfinite(max_val):
+        return None, 0.0
+    dx, dy = _subpixel(res, max_loc)
+    cx = x0 + max_loc[0] + dx + pw / 2.0
+    cy = y0 + max_loc[1] + dy + ph / 2.0
+    return (float(cx), float(cy)), float(max_val)
+
+
 def _flujo_local(gray_anterior, gray_actual, puntos):
     """Estima el desplazamiento robusto de los rasgos alrededor del punto elegido."""
     siguientes, estado, error = cv2.calcOpticalFlowPyrLK(
@@ -101,9 +161,15 @@ def _flujo_local(gray_anterior, gray_actual, puntos):
     consistentes = desviaciones <= limite
     if np.any(consistentes):
         desplazamiento = np.median(desplazamientos[consistentes], axis=0)
-    puntos_consistentes = ida[valido][consistentes]
+        desv_consistentes = desviaciones[consistentes]
+        puntos_consistentes = ida[valido][consistentes]
+    else:
+        desv_consistentes = desviaciones
+        puntos_consistentes = ida[valido]
+    sigma = float(np.median(desv_consistentes)) / max(1.0, np.sqrt(len(desv_consistentes)))
+    sigma = max(SIGMA_PX, sigma)
     puntos_siguientes = puntos_consistentes.reshape(-1, 1, 2).astype(np.float32)
-    return desplazamiento, puntos_siguientes
+    return desplazamiento, puntos_siguientes, sigma
 
 
 def _umbral_salto(saltos):
@@ -140,6 +206,9 @@ def trackear(
     previo = None
     frame_gris_previo = None
     puntos_opticos = None
+    plantilla_ref = None
+    plantilla_act = None
+    actualizar_plantilla = 0
     bgsub = None if punto_inicial is not None else cv2.createBackgroundSubtractorMOG2(
         history=250, varThreshold=16, detectShadows=False
     )
@@ -147,6 +216,11 @@ def trackear(
     descartados = 0
     multiples = 0
     detectados = 0
+    flujo_usado = 0
+    plantilla_usada = 0
+    redetectados = 0
+    perdidos_seguidos = 0
+    ultimo_salto = 0.0
 
     while True:
         ok, frame = cap.read()
@@ -154,6 +228,7 @@ def trackear(
             break
         gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         x_y = None
+        sigma = None
         if punto_inicial is not None and i == 0:
             alto, ancho = gris.shape
             x_inicial, y_inicial = punto_inicial
@@ -166,14 +241,62 @@ def trackear(
             x_y = punto_inicial
             puntos_opticos = _puntos_opticos(gris, punto_inicial)
             frame_gris_previo = gris
+            plantilla_ref, _ = _parche(gris, punto_inicial, RADIO_PLANTILLA)
+            plantilla_act = None if plantilla_ref is None else plantilla_ref.copy()
         elif punto_inicial is not None:
-            resultado = _flujo_local(frame_gris_previo, gris, puntos_opticos)
+            resultado = None
+            if frame_gris_previo is not None and puntos_opticos is not None and len(puntos_opticos):
+                resultado = _flujo_local(frame_gris_previo, gris, puntos_opticos)
+            flujo_pos, flujo_sigma = None, None
             if resultado is not None:
-                desplazamiento, puntos_opticos = resultado
-                x_y = (
-                    previo[0] + float(desplazamiento[0]),
-                    previo[1] + float(desplazamiento[1]),
+                desplazamiento, puntos_opticos, flujo_sigma = resultado
+                if previo is not None:
+                    flujo_pos = (
+                        previo[0] + float(desplazamiento[0]),
+                        previo[1] + float(desplazamiento[1]),
+                    )
+            centro_busqueda = previo if previo is not None else punto_inicial
+            radio_busqueda = int(np.clip(
+                2.5 * ultimo_salto + 40, RADIO_BUSQUEDA_MIN, RADIO_BUSQUEDA_MAX
+            ))
+            if perdidos_seguidos >= PERDIDOS_PARA_AMPLIAR:
+                radio_busqueda = min(RADIO_BUSQUEDA_MAX, max(radio_busqueda, 120))
+            mejor_pos, mejor_score = None, -1.0
+            for plantilla in (plantilla_ref, plantilla_act):
+                if plantilla is None:
+                    continue
+                pos, score = _match_plantilla(
+                    gris, plantilla, centro_busqueda, radio_busqueda
                 )
+                if pos is not None and score > mejor_score:
+                    mejor_pos, mejor_score = pos, score
+            usar_plantilla = mejor_pos is not None and mejor_score >= UMBRAL_PLANTILLA
+            if usar_plantilla:
+                x_y = mejor_pos
+                sigma = SIGMA_PX + 4.0 * max(0.0, 0.9 - mejor_score)
+                plantilla_usada += 1
+                if (mejor_score >= UMBRAL_ACTUALIZAR
+                        and i - actualizar_plantilla >= ACTUALIZAR_PLANTILLA_CADA):
+                    nueva, _ = _parche(gris, mejor_pos, RADIO_PLANTILLA)
+                    if nueva is not None:
+                        plantilla_act = nueva
+                        actualizar_plantilla = i
+                if (flujo_pos is not None
+                        and np.hypot(flujo_pos[0] - mejor_pos[0],
+                                     flujo_pos[1] - mejor_pos[1]) > DISCREPANCIA_FLUJO_PX):
+                    redetectados += 1
+            elif flujo_pos is not None:
+                x_y = flujo_pos
+                sigma = flujo_sigma if flujo_sigma is not None else SIGMA_PX
+                flujo_usado += 1
+            if x_y is not None:
+                reanclar = flujo_pos is None or (
+                    usar_plantilla and flujo_pos is not None
+                    and np.hypot(flujo_pos[0] - x_y[0],
+                                 flujo_pos[1] - x_y[1]) > DISCREPANCIA_FLUJO_PX
+                )
+                if reanclar:
+                    puntos_opticos = _puntos_opticos(gris, x_y)
                 frame_gris_previo = gris
         else:
             contornos = _contornos_movimiento(frame, bgsub)
@@ -207,12 +330,17 @@ def trackear(
         if x_y is not None:
             x, y = x_y
             if previo is not None:
-                saltos.append(float(np.hypot(x - previo[0], y - previo[1])))
+                salto = float(np.hypot(x - previo[0], y - previo[1]))
+                saltos.append(salto)
+                ultimo_salto = salto
             previo = (x, y)
-            filas.append((i / fps, x, y, SIGMA_PX, SIGMA_PX))
+            sigma = SIGMA_PX if sigma is None else max(SIGMA_PX, float(sigma))
+            filas.append((i / fps, x, y, sigma, sigma))
             detectados += 1
+            perdidos_seguidos = 0
         else:
             filas.append((i / fps, np.nan, np.nan, np.nan, np.nan))
+            perdidos_seguidos += 1
         if ver or frame_callback is not None:
             if x_y is None:
                 cv2.putText(
@@ -246,8 +374,11 @@ def trackear(
         "perdidos": i - detectados,
         "saltos_descartados": descartados,
         "frames_con_multiples_candidatos": multiples,
+        "cuadros_con_flujo": flujo_usado,
+        "cuadros_con_plantilla": plantilla_usada,
+        "redetecciones": redetectados,
         "metodo": (
-            "punto seleccionado (flujo optico)"
+            "punto seleccionado (flujo optico + plantilla)"
             if punto_inicial is not None else "movimiento"
         ),
     }
@@ -266,6 +397,9 @@ if __name__ == "__main__":
     ap.add_argument("video")
     ap.add_argument("--salida", default="tabla.csv")
     ap.add_argument("--ver", action="store_true", help="mostrar el seguimiento en pantalla")
+    ap.add_argument("--punto", type=float, nargs=2, metavar=("X", "Y"),
+                    help="punto inicial de la masa en el primer cuadro (px)")
     a = ap.parse_args()
-    d = trackear(a.video, a.salida, a.ver)
+    punto = tuple(a.punto) if a.punto else None
+    d = trackear(a.video, a.salida, a.ver, punto_inicial=punto)
     print(f"{len(d)} cuadros, {np.isnan(d[:, 1]).sum()} sin detección -> {a.salida}")
