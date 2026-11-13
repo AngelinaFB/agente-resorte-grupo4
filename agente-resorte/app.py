@@ -156,7 +156,7 @@ with analizador_col:
 
 
     def crear_video_tracking(contenido, nombre, punto_inicial, progreso=None):
-        """Genera una previsualización del seguimiento elegido sobre el video."""
+        """Genera una previsualización mp4 del seguimiento elegido."""
         with tempfile.TemporaryDirectory(prefix="resorte-tracking-") as temp_dir:
             ruta_video = Path(temp_dir) / Path(nombre).name
             ruta_salida = Path(temp_dir) / "tracking.mp4"
@@ -434,13 +434,18 @@ with analizador_col:
             vista_tracking
             and vista_tracking["firma"] == firma_videos
             and vista_tracking["indice"] == indice_tracking
-            and vista_tracking.get("formato") == "mp4"
             and vista_tracking.get("algoritmo") == algoritmo_tracking
             and vista_tracking.get("metodo_tracking") == metodo_tracking
             and vista_tracking.get("punto_inicial") == (punto_tracking if usar_punto_tracking else None)
         ):
             resumen = vista_tracking["resumen"]
-            st.video(vista_tracking["video"], format="video/mp4")
+            if vista_tracking.get("video"):
+                st.video(vista_tracking["video"], format="video/mp4")
+            else:
+                st.info(
+                    "El seguimiento se calculó, pero este equipo no pudo codificar el video "
+                    "de vista previa. El análisis puede continuar con los datos guardados."
+                )
             st.caption(
                 f"Método: {metodo_tracking} · "
                 f"Detecciones: {resumen['detectados']}/{resumen['cuadros']} cuadros · "

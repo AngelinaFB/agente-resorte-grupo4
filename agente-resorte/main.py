@@ -159,7 +159,25 @@ def analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis):
     # Se toma t=0 en el inicio del tramo para que A sea la amplitud de liberación.
     res = ajustar(t_fit - inicio, x_fit, sx_fit)
     if res.covar is None:
-        raise RuntimeError("el ajuste no tiene matriz de covarianza (¿no se detecta oscilación?)")
+        omega_estimado = float(res.params["omega"].value)
+        periodo_estimado = 2 * np.pi / omega_estimado if omega_estimado > 0 else np.nan
+        ciclos_estimados = (
+            (t_fit[-1] - t_fit[0]) / periodo_estimado
+            if np.isfinite(periodo_estimado) and periodo_estimado > 0
+            else 0.0
+        )
+        raise RuntimeError(
+            f"No se pudo estimar la incertidumbre del ajuste de {nombre}: "
+            "la matriz de covarianza quedó singular. "
+            f"El ajuste encontró A={res.params['A'].value:.4g} m, "
+            f"T={periodo_estimado:.4g} s y {ciclos_estimados:.2f} ciclos "
+            f"con {len(t_fit)} cuadros válidos. "
+            f"Seguimiento: {seguimiento.get('metodo', 'sin método informado')}, "
+            f"{seguimiento.get('detectados', len(t_fit))}/"
+            f"{seguimiento.get('cuadros', len(filas))} cuadros detectados. "
+            "Revisá la vista del seguimiento: el punto debe permanecer sobre la masa "
+            "durante varias oscilaciones completas."
+        )
     p = parametros_con_incerteza(res)
     corr = getattr(a, "corr_fps", None)
     if corr is None and fps_sigma:

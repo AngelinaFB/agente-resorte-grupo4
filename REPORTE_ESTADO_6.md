@@ -11,11 +11,17 @@ La calibración espacial permite marcar con el mouse dos extremos de una distanc
 
 La vista previa del seguimiento conserva la trayectoria en píxeles y el análisis final la reutiliza para evitar rastrear nuevamente el video previsualizado.
 
-## Entorno local
+## Entorno local y diagnóstico
 
-El error al abrir el selector provenía de Smart App Control de Windows, que bloqueaba una extensión nativa de pandas. El usuario desactivó Smart App Control y se verificó que pandas 3.1.1 importa correctamente en el entorno virtual. No faltaban dependencias del chat.
+Smart App Control bloqueaba una extensión nativa de pandas; el usuario lo desactivó y pandas 3.1.1 importa correctamente.
+
+La sugerencia anterior de instalar numdifftools para resolver la covarianza fue incorrecta. El método least_squares de lmfit calcula la covarianza a partir del Jacobiano; si devuelve None, la matriz del ajuste es singular. Se quitó numdifftools de requirements.txt y del entorno local. El error ahora incluye período, ciclos, cuadros válidos y resumen del tracking para ayudar a identificar datos sin una oscilación bien determinada.
+
+Se restauró el códec avc1 para la vista previa del seguimiento, como estaba antes del intento con mp4v, porque el usuario prefiere conservar el video aunque OpenCV deje un aviso de OpenH264 en la consola.
 
 ## Pendiente
+
+
 
 - Analizar la trayectoria para determinar las entradas que realmente faltan en cada cálculo y pedirlas por chat.
 - Aplicar las respuestas a los cálculos y producir el informe completo de cinemática, dinámica y energías.
@@ -24,4 +30,4 @@ El error al abrir el selector provenía de Smart App Control de Windows, que blo
 
 ## Verificación de estos cambios
 
-La sintaxis de app.py se verificó con ast.parse y git diff --check no detectó errores de whitespace. No se inició la app ni se ejecutaron pruebas automatizadas.
+La sintaxis de app.py y main.py se verificó con ast.parse; pip check no reporta conflictos y git diff --check no detecta errores de whitespace. No se ejecutó el análisis con el video R1 P3 ni pruebas automatizadas.
