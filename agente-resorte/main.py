@@ -2,7 +2,7 @@
 
 #Agente: video(s) de resorte -> tracking -> calibración -> señal -> ajuste -> informe.
 
-import argparse, os, io, json, contextlib
+import argparse, os, io, json, contextlib, tempfile
 import numpy as np
 import cv2
 from uncertainties import ufloat
@@ -73,15 +73,32 @@ def fmt_agregado(agg, unidad=""):
     return f"{txt} {unidad}".strip()
 
 
-def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
+def preanalizar_video(video, progreso=None, punto_inicial=None, frame_callback=None):
+    """Rastrea el video una vez y conserva la trayectoria para análisis posteriores."""
+    with tempfile.TemporaryDirectory(prefix="resorte-preanalisis-") as temp_dir:
+        csv_px = os.path.join(temp_dir, "trayectoria_px.csv")
+        filas = trackear(
+            video, csv_px, progreso=progreso, punto_inicial=punto_inicial,
+            frame_callback=frame_callback,
+        )
+        return {
+            "filas": np.asarray(filas).copy(),
+            "seguimiento": dict(getattr(filas, "resumen", {})),
+        }
+
+
+def analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis):
+    """Completa el informe usando una trayectoria ya extraída del video."""
     nombre = os.path.splitext(os.path.basename(video))[0]
     px_csv, m_csv = f"{carpeta}/{nombre}_px.csv", f"{carpeta}/{nombre}_m.csv"
 
-    filas = trackear(
-        video, px_csv, progreso=progreso, punto_inicial=punto_inicial
+    filas = preanalisis["filas"]
+    np.savetxt(
+        px_csv, filas, delimiter=",",
+        header="t_s,x_px,y_px,sx_px,sy_px", comments="",
     )
     perdidos = float(np.isnan(filas[:, 1]).mean())
-    seguimiento = dict(getattr(filas, "resumen", {}))
+    seguimiento = dict(preanalisis.get("seguimiento", {}))
 
     cap = cv2.VideoCapture(video)
     fps_decl = cap.get(cv2.CAP_PROP_FPS)
@@ -193,6 +210,17 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None):
     )
     resultado["estado"] = estado_video(resultado)
     return resultado
+
+
+def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None,
+             preanalisis=None, frame_callback=None):
+    """Interfaz compatible: permite pasar tracking ya calculado para reutilizarlo."""
+    if preanalisis is None:
+        preanalisis = preanalizar_video(
+            video, progreso=progreso, punto_inicial=punto_inicial,
+            frame_callback=frame_callback,
+        )
+    return analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis)
 
 
 def agregado(vals):

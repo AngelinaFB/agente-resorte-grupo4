@@ -11,6 +11,7 @@
       canvas {
         display: block;
         width: 100%;
+        max-width: 760px;
         height: auto;
         cursor: crosshair;
       }
@@ -21,7 +22,7 @@
     </style>
   </head>
   <body>
-    <p class="hint">Hacé clic sobre el punto rojo de la masa.</p>
+    <p id="hint" class="hint"></p>
     <canvas id="frame"></canvas>
     <script>
       const canvas = document.getElementById("frame");
@@ -29,6 +30,7 @@
       const image = new Image();
       let args = null;
       let selectedPoint = null;
+      let selectedPoints = [];
 
       function send(type, data) {
         window.parent.postMessage(
@@ -39,10 +41,37 @@
 
       function draw() {
         if (!args || !image.complete || !image.naturalWidth) return;
+        const displayWidth = args.display_width ?? 760;
+        canvas.style.maxWidth =
+          typeof displayWidth === "number" ? `${displayWidth}px` : displayWidth;
+        document.getElementById("hint").textContent =
+          args.selection_mode === "two_points"
+            ? "Hacé clic en los dos extremos del tramo conocido de la regla."
+            : "Hacé clic sobre el punto de la masa.";
         canvas.width = args.image_width;
         canvas.height = args.image_height;
         context.drawImage(image, 0, 0, canvas.width, canvas.height);
-        if (selectedPoint) {
+        if (args.selection_mode === "two_points") {
+          if (selectedPoints.length === 2) {
+            context.beginPath();
+            context.moveTo(selectedPoints[0].x, selectedPoints[0].y);
+            context.lineTo(selectedPoints[1].x, selectedPoints[1].y);
+            context.strokeStyle = "#00ff66";
+            context.lineWidth = Math.max(2, canvas.width / 400);
+            context.stroke();
+          }
+          selectedPoints.forEach((point, index) => {
+            context.beginPath();
+            context.arc(point.x, point.y, 12, 0, 2 * Math.PI);
+            context.fillStyle = "#00ff66";
+            context.fill();
+            context.fillStyle = "#062b15";
+            context.font = `bold ${Math.max(14, canvas.width / 70)}px sans-serif`;
+            context.textAlign = "center";
+            context.textBaseline = "middle";
+            context.fillText(String(index + 1), point.x, point.y);
+          });
+        } else if (selectedPoint) {
           context.beginPath();
           context.arc(selectedPoint.x, selectedPoint.y, 10, 0, 2 * Math.PI);
           context.strokeStyle = "#00ff66";
@@ -62,7 +91,7 @@
       canvas.addEventListener("click", (event) => {
         if (!args) return;
         const bounds = canvas.getBoundingClientRect();
-        selectedPoint = {
+        const point = {
           x: Math.max(
             0,
             Math.min(
@@ -78,9 +107,15 @@
             )
           ),
         };
+        if (args.selection_mode === "two_points") {
+          if (selectedPoints.length >= 2) selectedPoints = [];
+          selectedPoints.push(point);
+        } else {
+          selectedPoint = point;
+        }
         draw();
         send("streamlit:setComponentValue", {
-          value: selectedPoint,
+          value: args.selection_mode === "two_points" ? selectedPoints : selectedPoint,
           dataType: "json",
         });
       });
@@ -89,6 +124,7 @@
         if (!event.data || event.data.type !== "streamlit:render") return;
         args = event.data.args;
         selectedPoint = args.selected_point || null;
+        selectedPoints = Array.isArray(args.selected_points) ? args.selected_points : [];
         if (image.src !== args.image_data) image.src = args.image_data;
         else draw();
       });
