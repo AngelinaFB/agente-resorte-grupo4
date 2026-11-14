@@ -1,5 +1,5 @@
 """Seguimiento visual de la masa: video -> tabla en pixeles."""
-import argparse, csv
+import argparse, csv, json, os
 from collections import deque
 import cv2
 import numpy as np
@@ -25,6 +25,17 @@ DISCREPANCIA_FLUJO_PX = 8.0
 
 class TablaTracking(np.ndarray):
     """Array (N, 5) del tracking; el resumen queda en el atributo `.resumen`."""
+
+
+def ruta_metadatos(salida):
+    """Ruta del JSON que acompaña a una trayectoria CSV."""
+    return os.path.splitext(str(salida))[0] + "_tracking.json"
+
+
+def guardar_metadatos(ruta, metadatos):
+    """Escribe metadatos JSON junto a la trayectoria (UTF-8)."""
+    with open(ruta, "w", encoding="utf-8") as f:
+        json.dump(metadatos, f, indent=2, ensure_ascii=False, allow_nan=True)
 
 
 def _contornos_movimiento(frame, bgsub):
@@ -186,11 +197,13 @@ def trackear(
     progreso=None,
     frame_callback=None,
     punto_inicial=None,
+    metadatos=None,
 ):
     """Devuelve (N, 5): t_s, x_px, y_px, sx_px, sy_px; NaN donde no se detectó.
 
     Si se pasa `frame_callback`, recibe cada cuadro con el resultado del tracking
-    superpuesto, sin abrir una ventana interactiva.
+    superpuesto, sin abrir una ventana interactiva. También guarda un JSON de
+    metadatos junto al CSV para poder reanalizar la trayectoria sin el video.
     """
     cap = cv2.VideoCapture(video)
     if not cap.isOpened():
@@ -199,6 +212,8 @@ def trackear(
     if not fps or fps <= 0:
         raise RuntimeError("El video no informa fps")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     intervalo_progreso = max(1, total_frames // 100) if total_frames > 0 else 30
     punto_inicial = None if punto_inicial is None else tuple(map(float, punto_inicial))
 
@@ -221,12 +236,15 @@ def trackear(
     redetectados = 0
     perdidos_seguidos = 0
     ultimo_salto = 0.0
+    flujo_confiable = False
 
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if i == 0:
+            alto, ancho = gris.shape
         x_y = None
         sigma = None
         if punto_inicial is not None and i == 0:
@@ -249,6 +267,7 @@ def trackear(
                 resultado = _flujo_local(frame_gris_previo, gris, puntos_opticos)
             flujo_pos, flujo_sigma = None, None
             if resultado is not None:
+                flujo_confiable = True
                 desplazamiento, puntos_opticos, flujo_sigma = resultado
                 if previo is not None:
                     flujo_pos = (
@@ -271,31 +290,38 @@ def trackear(
                 if pos is not None and score > mejor_score:
                     mejor_pos, mejor_score = pos, score
             usar_plantilla = mejor_pos is not None and mejor_score >= UMBRAL_PLANTILLA
-            if usar_plantilla:
-                x_y = mejor_pos
-                sigma = SIGMA_PX + 4.0 * max(0.0, 0.9 - mejor_score)
-                plantilla_usada += 1
-                if (mejor_score >= UMBRAL_ACTUALIZAR
-                        and i - actualizar_plantilla >= ACTUALIZAR_PLANTILLA_CADA):
-                    nueva, _ = _parche(gris, mejor_pos, RADIO_PLANTILLA)
-                    if nueva is not None:
-                        plantilla_act = nueva
-                        actualizar_plantilla = i
-                if (flujo_pos is not None
-                        and np.hypot(flujo_pos[0] - mejor_pos[0],
-                                     flujo_pos[1] - mejor_pos[1]) > DISCREPANCIA_FLUJO_PX):
-                    redetectados += 1
-            elif flujo_pos is not None:
+            plantilla_coherente = (
+                usar_plantilla and flujo_pos is not None
+                and np.hypot(
+                    flujo_pos[0] - mejor_pos[0], flujo_pos[1] - mejor_pos[1]
+                ) <= DISCREPANCIA_FLUJO_PX
+            )
+            if (usar_plantilla and mejor_score >= UMBRAL_ACTUALIZAR
+                    and i - actualizar_plantilla >= ACTUALIZAR_PLANTILLA_CADA
+                    and (flujo_pos is None or plantilla_coherente)):
+                nueva, _ = _parche(gris, mejor_pos, RADIO_PLANTILLA)
+                if nueva is not None:
+                    plantilla_act = nueva
+                    actualizar_plantilla = i
+            # El flujo óptico se prioriza: la plantilla suele engancharse al fondo
+            # cuando la masa se mueve rápido. La plantilla queda como respaldo
+            # únicamente si el flujo nunca pudo inicializarse.
+            if flujo_pos is not None:
                 x_y = flujo_pos
                 sigma = flujo_sigma if flujo_sigma is not None else SIGMA_PX
                 flujo_usado += 1
+                if usar_plantilla and not plantilla_coherente:
+                    redetectados += 1
+            elif usar_plantilla and not flujo_confiable:
+                # La plantilla solo se usa si el flujo nunca pudo inicializarse
+                # (por ejemplo, un marcador liso sobre fondo liso). En videos
+                # reales, recurrir a la plantilla tras una pérdida suele enganchar
+                # el fondo y arrastrar el punto lejos de la masa.
+                x_y = mejor_pos
+                sigma = SIGMA_PX + 4.0 * max(0.0, 0.9 - mejor_score)
+                plantilla_usada += 1
             if x_y is not None:
-                reanclar = flujo_pos is None or (
-                    usar_plantilla and flujo_pos is not None
-                    and np.hypot(flujo_pos[0] - x_y[0],
-                                 flujo_pos[1] - x_y[1]) > DISCREPANCIA_FLUJO_PX
-                )
-                if reanclar:
+                if flujo_pos is None:
                     puntos_opticos = _puntos_opticos(gris, x_y)
                 frame_gris_previo = gris
         else:
@@ -384,6 +410,27 @@ def trackear(
     }
     tabla.resumen = resumen
     trackear.ultimo_resumen = resumen
+    archivo_video = os.path.abspath(video) if os.path.exists(video) else str(video)
+    meta = {
+        "version_formato": 1,
+        "archivo_csv": os.path.basename(str(salida)),
+        "video": archivo_video,
+        "archivo_video": os.path.basename(str(video)),
+        "fps_declarado": float(fps),
+        "cuadros_totales": total_frames,
+        "tamano_cuadro_px": [ancho, alto],
+        "punto_inicial_px": (
+            None if punto_inicial is None
+            else [float(punto_inicial[0]), float(punto_inicial[1])]
+        ),
+        "metodo": resumen["metodo"],
+        "columnas": ["t_s", "x_px", "y_px", "sx_px", "sy_px"],
+        "resumen": resumen,
+    }
+    if metadatos:
+        meta.update(metadatos)
+    guardar_metadatos(ruta_metadatos(salida), meta)
+    tabla.metadatos = meta
     if progreso is not None and (total_frames <= 0 or i % intervalo_progreso != 0):
         progreso(i, total_frames if total_frames > 0 else None)
     print(f"tracking: {resumen['cuadros']} cuadros | "

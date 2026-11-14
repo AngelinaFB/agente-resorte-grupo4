@@ -45,12 +45,14 @@ def responder_chat_inicial(mensaje):
         regla = st.session_state.get("longitud_regla", 0.300)
         pendientes = []
         if metodo == "Punto marcado · flujo óptico":
-            indice = st.session_state.get("indice_video_tracking", 0)
-            indice = min(max(int(indice or 0), 0), cantidad - 1)
-            video = videos_actuales[indice]
-            if not st.session_state.get(f"punto_tracking_{video.file_id}"):
+            faltantes = [
+                video.name for video in videos_actuales
+                if not st.session_state.get(f"punto_tracking_{video.file_id}")
+            ]
+            if faltantes:
                 pendientes.append(
-                    f"marcar la masa en el primer cuadro de {video.name} para el tracking"
+                    "marcar la masa en el primer cuadro de cada video: "
+                    + ", ".join(faltantes)
                 )
 
         respuesta = (
@@ -200,6 +202,9 @@ with analizador_col:
             preanalisis = {
                 "filas": np.asarray(tabla).copy(),
                 "seguimiento": dict(tabla.resumen),
+                "metadatos": dict(getattr(tabla, "metadatos", {})),
+                "nombre": Path(nombre).stem,
+                "video": str(ruta_video),
             }
             return ruta_salida.read_bytes(), preanalisis
 
@@ -381,9 +386,9 @@ with analizador_col:
             ]
             if sin_punto_propio:
                 st.warning(
-                    "Estos videos no tienen un punto propio y usarán el punto del video seleccionado: "
+                    "Falta marcar la masa en el primer cuadro de: "
                     + ", ".join(sin_punto_propio)
-                    + ". Para mejorar la precisión, elegí el punto de la masa en cada video."
+                    + ". Cada video debe tener su propio punto; no se reutiliza el punto de otro video."
                 )
 
         if col_boton.button(
@@ -486,8 +491,8 @@ with analizador_col:
             st.markdown("**Calibración con regla**")
             puntos = None
             if frame_size:
-                c_largo, c_ventana, _ = st.columns(
-                    [1.2, 1.4, 5], vertical_alignment="bottom"
+                c_largo, c_ventana, c_eje, _ = st.columns(
+                    [1.2, 1.4, 1.0, 4], vertical_alignment="bottom"
                 )
                 regla_m = c_largo.number_input(
                     "Longitud (m)", min_value=0.000001, value=0.300, step=0.010,
@@ -498,6 +503,10 @@ with analizador_col:
                     "Ventana (cuadros)", [7, 11, 21, 41], index=1,
                     help="Cantidad de cuadros que se usan para suavizar la posición, velocidad y aceleración. Valores grandes suavizan más, pero pueden borrar detalles.",
                 )
+                eje = c_eje.selectbox(
+                    "Eje", ["auto", "x", "y"], index=0, key="eje_analisis",
+                    help="Eje de oscilación. Auto usa el de mayor desvío; elegí x o y si el movimiento es conocido.",
+                )
                 puntos = (
                     tuple((punto["x"], punto["y"]) for punto in puntos_regla)
                     if len(puntos_regla) == 2
@@ -506,8 +515,8 @@ with analizador_col:
                 if puntos is None:
                     st.info("Marcá los dos extremos de la regla en el cuadro de referencia.")
             else:
-                c_largo, c_ventana, _ = st.columns(
-                    [1.2, 1.4, 5], vertical_alignment="bottom"
+                c_largo, c_ventana, c_eje, _ = st.columns(
+                    [1.2, 1.4, 1.0, 4], vertical_alignment="bottom"
                 )
                 regla_m = c_largo.number_input(
                     "Longitud (m)", min_value=0.000001, value=0.300, step=0.010,
@@ -516,6 +525,10 @@ with analizador_col:
                 ventana = c_ventana.selectbox(
                     "Ventana (cuadros)", [7, 11, 21, 41], index=1,
                     help="Ventana de Savitzky-Golay para filtrar posición, velocidad y aceleración.",
+                )
+                eje = c_eje.selectbox(
+                    "Eje", ["auto", "x", "y"], index=0, key="eje_analisis",
+                    help="Eje de oscilación. Auto usa el de mayor desvío.",
                 )
         with st.expander("Chequeo estático opcional"):
             st.caption("Opcional. Solo sirve para calcular k por F = kx. NO es necesario para obtener k dinámico con el ajuste x(t).")
@@ -537,7 +550,7 @@ with analizador_col:
             disabled=(
                 not videos
                 or len(puntos_regla) != 2
-                or (usar_punto_tracking and punto_tracking is None)
+                or (usar_punto_tracking and (punto_tracking is None or bool(sin_punto_propio)))
                 or st.session_state.analisis_ocupado
             ),
         )
@@ -556,6 +569,7 @@ with analizador_col:
         puntos,
         regla_m,
         ventana,
+        eje,
         masas_texto,
         elongaciones_texto,
         usar_sigma_elongacion,
@@ -602,9 +616,12 @@ with analizador_col:
                     f_led=None,
                     fps_real=None,
                     ventana=ventana,
+                    eje=eje,
                     inicio=None,
+                    fin=None,
                     recorte_auto=True,
                     ventana_inicio=0.5,
+                    umbral_inicio=0.15,
                     sigma_g=0.01,
                     sigma_elongacion=sigma_elongacion if usar_sigma_elongacion else None,
                     masas_estaticas=masas_estaticas,
@@ -647,7 +664,7 @@ with analizador_col:
                         elif isinstance(guardado, dict):
                             punto_video = (guardado["x"], guardado["y"])
                         else:
-                            punto_video = punto_tracking
+                            punto_video = None
 
                         def actualizar_progreso(actual, total, indice=index, cantidad=len(rutas)):
                             if total:
@@ -660,6 +677,11 @@ with analizador_col:
                             barra.progress(porcentaje, text=f"{porcentaje}% · {texto}")
 
                         try:
+                            if usar_punto_tracking and punto_video is None:
+                                raise ValueError(
+                                    f"{video_actual.name}: falta marcar la masa en el primer cuadro; "
+                                    "cada video debe tener su propio punto de tracking."
+                                )
                             preanalisis = None
                             vista_actual = st.session_state.get("vista_tracking")
                             if (
@@ -691,7 +713,7 @@ with analizador_col:
                     escribir_informe(resultados, fallidos, args, escala, k_e, str(informe_path))
                     json_path = salidas_dir / "resultados.json"
                     json_path.write_text(
-                        json.dumps(resultados_json(resultados), indent=2, ensure_ascii=False),
+                        json.dumps(resultados_json(resultados, args), indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
                     archivos = {

@@ -3,7 +3,7 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_filter, detrend, butter, sosfilt, hilbert
 
 
 def cargar(csv):
@@ -20,48 +20,123 @@ def rellenar_nan(t, x):
     return x, int(malos.sum())
 
 
-def detectar_inicio(t, x, ventana_s=0.5, umbral=0.15):
-    """Segundo en que comienza la oscilación, para no ajustar el tramo estático.
+def _frecuencia_dominante(t, x, fraccion_final=0.3):
+    """Frecuencia del pico espectral en el tramo final, sin la deriva lenta."""
+    if len(t) < 12:
+        return None
+    inicio = max(0, int((1.0 - fraccion_final) * len(t)))
+    tramo = detrend(np.asarray(x[inicio:], dtype=float))
+    if len(tramo) < 8 or not np.any(np.isfinite(tramo)):
+        return None
+    dt = float(np.median(np.diff(t)))
+    if not np.isfinite(dt) or dt <= 0:
+        return None
+    ventana = np.hanning(len(tramo))
+    espectro = np.abs(np.fft.rfft(tramo * ventana))
+    frecuencias = np.fft.rfftfreq(len(tramo), dt)
+    # Evita la deriva y el ruido de alta frecuencia; el resorte real cae en este rango.
+    banda = (frecuencias >= 0.2) & (frecuencias <= min(5.0, 0.45 / dt))
+    if not np.any(banda):
+        return None
+    indices = np.flatnonzero(banda)
+    indice = indices[int(np.argmax(espectro[banda]))]
+    frecuencia = float(frecuencias[indice])
+    return frecuencia if np.isfinite(frecuencia) and frecuencia > 0 else None
 
-    Usa una ventana causal (solo cuadros pasados) para no mirar hacia adelante y
-    busca el primer tramo sostenido que supera `umbral` veces el desvío máximo.
-    Si no hay un prefijo quieto, devuelve el inicio del registro (t[0]).
+
+def detectar_inicio_detalle(t, x, ventana_s=0.5, umbral=0.15):
+    """Detecta el inicio de la oscilación sostenida y devuelve (t_inicio, detalle).
+
+    La decisión se toma sobre la envolvente de la componente oscilatoria, no sobre
+    el desvío total: así un movimiento lento de la mano o un reacomodo de la masa
+    no se confunde con la liberación. El umbral es una fracción de la amplitud
+    final de la envolvente (percentil 90 del último 20 % del registro). Si no hay
+    un prefijo quieto, el inicio es t[0], porque no hay nada que recortar.
     """
     t = np.asarray(t, dtype=float)
     x = np.asarray(x, dtype=float)
     if len(t) < 5 or len(x) != len(t):
-        return float(t[0]) if len(t) else 0.0
+        return (float(t[0]) if len(t) else 0.0), {
+            "metodo": "envolvente de la oscilación",
+            "motivo": "registro demasiado corto",
+        }
     dt = float(np.median(np.diff(t)))
     if not np.isfinite(dt) or dt <= 0:
-        return float(t[0])
-    n_ventana = max(5, int(round(ventana_s / dt)))
-    n_ventana = min(n_ventana, len(x))
+        return float(t[0]), {"metodo": "envolvente de la oscilación", "motivo": "dt inválido"}
+    n_ventana = max(5, min(int(round(ventana_s / dt)), len(x)))
+    info = {
+        "metodo": "envolvente de la oscilación",
+        "ventana_s": float(ventana_s),
+        "umbral_relativo": float(umbral),
+        "frecuencia_hz": None,
+        "amplitud_final": None,
+        "inicio_en_t0": True,
+        "motivo": "",
+    }
 
-    # Media y desvío de una ventana causal: en i solo se usan x[0..i].
+    frecuencia = _frecuencia_dominante(t, x)
+    if frecuencia is None:
+        info["motivo"] = "no se pudo estimar la frecuencia de oscilación"
+        return float(t[0]), info
+    info["frecuencia_hz"] = frecuencia
+
+    # La banda ancha tolera que el período cambie algo por la masa del resorte o
+    # por una ligera no linealidad, pero descarta la deriva y el movimiento lento.
+    nyquist = 0.5 / dt
+    bajo = max(0.12, 0.55 * frecuencia)
+    alto = min(0.98 * nyquist, 1.8 * frecuencia)
+    if alto <= bajo:
+        info["motivo"] = "banda de oscilación inválida"
+        return float(t[0]), info
+    try:
+        sos = butter(4, [bajo, alto], btype="band", fs=1.0 / dt, output="sos")
+        oscilacion = sosfilt(sos, detrend(x))
+        envolvente = np.abs(hilbert(oscilacion))
+    except (ValueError, FloatingPointError):
+        info["motivo"] = "no se pudo filtrar la oscilación"
+        return float(t[0]), info
+
+    # Suavizado causal de la envolvente: conserva el orden temporal y exige que
+    # la oscilación se mantenga, no sólo un pico aislado.
     kernel = np.ones(n_ventana) / n_ventana
-    pad = np.pad(x, (n_ventana - 1, 0), mode="edge")
-    media = np.convolve(pad, kernel, mode="valid")
-    pad2 = np.pad(x ** 2, (n_ventana - 1, 0), mode="edge")
-    media2 = np.convolve(pad2, kernel, mode="valid")
-    desvio = np.sqrt(np.maximum(media2 - media ** 2, 0.0))
+    envolvente = np.convolve(envolvente, kernel, mode="full")[:len(envolvente)]
+    final = max(n_ventana, int(round(0.2 * len(envolvente))))
+    amp_final = float(np.nanpercentile(envolvente[-final:], 90))
+    info["amplitud_final"] = amp_final
+    if not np.isfinite(amp_final) or amp_final <= 0:
+        info["motivo"] = "amplitud final nula o no finita"
+        return float(t[0]), info
 
-    max_desvio = float(np.nanmax(desvio))
-    if not np.isfinite(max_desvio) or max_desvio <= 0:
-        return float(t[0])
-    sobre = desvio > umbral * max_desvio
+    limite = umbral * amp_final
+    info["amplitud_umbral"] = float(limite)
+    sobre = envolvente > limite
     corrida = 0
     for indice, activo in enumerate(sobre):
         corrida = corrida + 1 if activo else 0
         if corrida >= n_ventana:
             inicio = indice - n_ventana + 1
-            # Si la señal ya oscilaba desde el primer cuadro, el arranque de la
-            # ventana causal pierde el primer semiciclo: se retrocede un poco.
-            # Con un prefijo quieto real no se retrocede para no meter cuadros
-            # estáticos que inflan el chi2.
-            if inicio < n_ventana:
-                inicio = max(0, inicio - max(1, n_ventana // 4))
-            return float(t[inicio])
-    return float(t[0])
+            # Si la ventana ya estaba activa desde el comienzo, no hay prefijo
+            # quieto: se conserva t[0] y se informa para que el usuario revise.
+            if inicio <= 0 or (float(t[inicio]) - float(t[0])) <= ventana_s:
+                info["inicio_en_t0"] = True
+                info["motivo"] = "la oscilación ya está presente desde el primer cuadro"
+                return float(t[0]), info
+            inicio_sin_compensar = float(t[inicio])
+            # La media móvil causal introduce un retardo de media ventana. Se
+            # compensa para no recortar el primer máximo de la liberación.
+            compensacion = 0.5 * ventana_s
+            info["inicio_en_t0"] = False
+            info["inicio_sin_compensar_s"] = inicio_sin_compensar
+            info["compensacion_s"] = compensacion
+            info["motivo"] = "primer tramo sostenido por encima del umbral"
+            return max(float(t[0]), inicio_sin_compensar - compensacion), info
+    info["motivo"] = "no se encontró un tramo oscilatorio sostenido"
+    return float(t[0]), info
+
+
+def detectar_inicio(t, x, ventana_s=0.5, umbral=0.15):
+    """Segundo en que comienza la oscilación; compatible con la interfaz anterior."""
+    return detectar_inicio_detalle(t, x, ventana_s=ventana_s, umbral=umbral)[0]
 
 
 def derivar(t, y):
