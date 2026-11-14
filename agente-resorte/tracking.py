@@ -198,6 +198,7 @@ def trackear(
     frame_callback=None,
     punto_inicial=None,
     metadatos=None,
+    desde_s=0.0,
 ):
     """Devuelve (N, 5): t_s, x_px, y_px, sx_px, sy_px; NaN donde no se detectó.
 
@@ -212,12 +213,27 @@ def trackear(
     if not fps or fps <= 0:
         raise RuntimeError("El video no informa fps")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    desde_s = float(desde_s or 0.0)
+    if not np.isfinite(desde_s) or desde_s < 0:
+        cap.release()
+        raise ValueError("--desde debe ser un tiempo finito mayor o igual que 0 s")
+    primer_indice = int(round(desde_s * fps))
+    if total_frames > 0 and primer_indice >= total_frames:
+        cap.release()
+        raise ValueError(
+            f"--desde {desde_s:.3f} s queda fuera del video ({total_frames / fps:.3f} s)"
+        )
+    if primer_indice and punto_inicial is None:
+        cap.release()
+        raise ValueError("para rastrear desde un cuadro posterior al primero indicá un punto inicial")
+    if primer_indice:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, primer_indice)
     ancho = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     alto = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     intervalo_progreso = max(1, total_frames // 100) if total_frames > 0 else 30
     punto_inicial = None if punto_inicial is None else tuple(map(float, punto_inicial))
 
-    filas, i = [], 0
+    filas, i = [], primer_indice
     previo = None
     frame_gris_previo = None
     puntos_opticos = None
@@ -243,11 +259,12 @@ def trackear(
         if not ok:
             break
         gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if i == 0:
+        primer_cuadro = i == primer_indice
+        if primer_cuadro:
             alto, ancho = gris.shape
         x_y = None
         sigma = None
-        if punto_inicial is not None and i == 0:
+        if punto_inicial is not None and primer_cuadro:
             alto, ancho = gris.shape
             x_inicial, y_inicial = punto_inicial
             if not (0 <= x_inicial < ancho and 0 <= y_inicial < alto):
@@ -395,9 +412,9 @@ def trackear(
 
     tabla = np.asarray(filas, dtype=float).reshape(-1, 5).view(TablaTracking)
     resumen = {
-        "cuadros": i,
+        "cuadros": len(filas),
         "detectados": detectados,
-        "perdidos": i - detectados,
+        "perdidos": len(filas) - detectados,
         "saltos_descartados": descartados,
         "frames_con_multiples_candidatos": multiples,
         "cuadros_con_flujo": flujo_usado,
@@ -423,6 +440,10 @@ def trackear(
             None if punto_inicial is None
             else [float(punto_inicial[0]), float(punto_inicial[1])]
         ),
+        "instante_punto_s": (
+            None if punto_inicial is None else float(primer_indice / fps)
+        ),
+        "desde_s": float(primer_indice / fps),
         "metodo": resumen["metodo"],
         "columnas": ["t_s", "x_px", "y_px", "sx_px", "sy_px"],
         "resumen": resumen,
@@ -446,7 +467,9 @@ if __name__ == "__main__":
     ap.add_argument("--ver", action="store_true", help="mostrar el seguimiento en pantalla")
     ap.add_argument("--punto", type=float, nargs=2, metavar=("X", "Y"),
                     help="punto inicial de la masa en el primer cuadro (px)")
+    ap.add_argument("--desde", type=float, default=0.0,
+                    help="segundo del video en el que empieza el tracking (requiere --punto en ese cuadro)")
     a = ap.parse_args()
     punto = tuple(a.punto) if a.punto else None
-    d = trackear(a.video, a.salida, a.ver, punto_inicial=punto)
+    d = trackear(a.video, a.salida, a.ver, punto_inicial=punto, desde_s=a.desde)
     print(f"{len(d)} cuadros, {np.isnan(d[:, 1]).sum()} sin detección -> {a.salida}")

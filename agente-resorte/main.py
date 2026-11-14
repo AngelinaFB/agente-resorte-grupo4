@@ -99,6 +99,26 @@ def cargar_puntos_json(ruta):
     raise ValueError(f"{ruta}: se esperaba un objeto o una lista de puntos")
 
 
+def cargar_instantes_json(ruta):
+    """Lee instantes opcionales por video junto con los puntos del JSON."""
+    with open(ruta, encoding="utf-8") as f:
+        datos = json.load(f)
+    if isinstance(datos, dict) and "puntos" in datos:
+        datos = datos["puntos"]
+    elementos = datos.items() if isinstance(datos, dict) else (
+        ((item.get("video") or item.get("nombre") or item.get("archivo")), item)
+        for item in datos if isinstance(item, dict)
+    ) if isinstance(datos, list) else []
+    instantes = {}
+    for clave, valor in elementos:
+        if clave is None or not isinstance(valor, dict):
+            continue
+        tiempo = next((valor[k] for k in ("t_punto_s", "t_punto", "instante_punto_s") if k in valor), None)
+        if tiempo is not None:
+            instantes[_normalizar_clave(clave)] = float(tiempo)
+    return instantes
+
+
 def resolver_punto(puntos, video):
     """Devuelve ((x,y), clave) del punto que corresponde exactamente a ese video."""
     for clave in _claves_video(video):
@@ -169,6 +189,8 @@ VARIABLES_AGREGADAS = (
 def estado_video(r):
     """Criterio orientativo único para decidir si una repetición es promediable."""
     perdidos = r.get("perdidos_analisis", r["perdidos"])
+    if r.get("estado") == "invalido" or perdidos > .30 or r.get("ciclos", 0) < 5 or r.get("singular"):
+        return "invalido"
     return "aceptable" if (
         perdidos <= .05
         and .3 <= r["redchi"] <= 3
@@ -205,13 +227,14 @@ def fmt_agregado(agg, unidad=""):
     return f"{txt} {unidad}".strip()
 
 
-def preanalizar_video(video, progreso=None, punto_inicial=None, frame_callback=None):
+def preanalizar_video(video, progreso=None, punto_inicial=None, frame_callback=None, desde_s=0.0):
     """Rastrea el video una vez y conserva la trayectoria para análisis posteriores."""
     with tempfile.TemporaryDirectory(prefix="resorte-preanalisis-") as temp_dir:
         csv_px = os.path.join(temp_dir, "trayectoria_px.csv")
         filas = trackear(
             video, csv_px, progreso=progreso, punto_inicial=punto_inicial,
             frame_callback=frame_callback,
+            desde_s=desde_s,
         )
         return {
             "filas": np.asarray(filas).copy(),
@@ -332,18 +355,13 @@ def analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis):
             if np.isfinite(periodo_estimado) and periodo_estimado > 0
             else 0.0
         )
-        raise RuntimeError(
-            f"No se pudo estimar la incertidumbre del ajuste de {nombre}: "
-            "la matriz de covarianza quedó singular. "
-            f"El ajuste encontró A={res.params['A'].value:.4g} m, "
-            f"T={periodo_estimado:.4g} s y {ciclos_estimados:.2f} ciclos "
-            f"con {len(t_fit)} cuadros válidos. "
-            f"Seguimiento: {seguimiento.get('metodo', 'sin método informado')}, "
-            f"{seguimiento.get('detectados', len(t_fit))}/"
-            f"{seguimiento.get('cuadros', len(filas))} cuadros detectados. "
-            "Revisá la vista del seguimiento: el punto debe permanecer sobre la masa "
-            "durante varias oscilaciones completas."
-        )
+        return dict(nombre=nombre, estado="invalido", motivo="ajuste singular (matriz de covarianza singular)",
+                    singular=True, perdidos=perdidos, perdidos_analisis=perdidos_analisis,
+                    seguimiento=seguimiento, inicio_s=inicio, fin_s=fin,
+                    inicio_auto_s=float(inicio_auto), inicio_origen=origen_inicio,
+                    inicio_info=info_inicio, punto_inicial_px=metadatos.get("punto_inicial_px"),
+                    ciclos=ciclos_estimados, muestras_T=0.0, eje=eje, trayectoria_csv=os.path.basename(px_csv),
+                    fps_decl=fps_decl, fps_uso=fps_uso, fps_sigma=fps_sigma, fps_origen=origen)
     p = parametros_con_incerteza(res)
     corr = getattr(a, "corr_fps", None)
     if corr is None and fps_sigma:
@@ -415,16 +433,22 @@ def analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis):
         maximos=mx, energia=energia, comp=comp,
     )
     resultado["estado"] = estado_video(resultado)
+    if resultado["estado"] == "invalido":
+        if perdidos_analisis > .30:
+            resultado["motivo"] = f"más de 30 % de cuadros perdidos en el tramo ({100*perdidos_analisis:.1f} %)"
+        elif ciclos < 5:
+            resultado["motivo"] = f"menos de 5 ciclos observados ({ciclos:.2f})"
     return resultado
 
 
 def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None,
-             preanalisis=None, frame_callback=None):
+             preanalisis=None, frame_callback=None, desde_s=0.0):
     """Interfaz compatible: permite pasar tracking ya calculado para reutilizarlo."""
     if preanalisis is None:
         preanalisis = preanalizar_video(
             video, progreso=progreso, punto_inicial=punto_inicial,
             frame_callback=frame_callback,
+            desde_s=desde_s,
         )
     return analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis)
 
@@ -502,27 +526,26 @@ def resultados_json(res, a=None):
         calidad = r.get("estado", estado_video(r))
         perdidos_analisis = float(r.get("perdidos_analisis", r["perdidos"]))
         alertas = []
+        invalido = calidad == "invalido"
         if perdidos_analisis > .05: alertas.append("más de 5 % de cuadros sin detección en el tramo analizado")
-        if r["redchi"] < .3 or r["redchi"] > 3: alertas.append("chi cuadrado reducido fuera del rango orientativo 0.3–3")
-        if r["ciclos"] < 5: alertas.append("menos de 5 ciclos observados")
-        if r["muestras_T"] < 10: alertas.append("menos de 10 cuadros por período")
-        if r["gamma"].n < 2*r["gamma"].s: alertas.append("amortiguamiento compatible con cero")
-        resultados = {nombre: _medida_json(r[clave], unidad)
+        if invalido: alertas.append(r.get("motivo", "resultado inválido"))
+        if not invalido:
+            if r["redchi"] < .3 or r["redchi"] > 3: alertas.append("chi cuadrado reducido fuera del rango orientativo 0.3–3")
+            if r["ciclos"] < 5: alertas.append("menos de 5 ciclos observados")
+            if r["muestras_T"] < 10: alertas.append("menos de 10 cuadros por período")
+            if r["gamma"].n < 2*r["gamma"].s: alertas.append("amortiguamiento compatible con cero")
+        resultados = {} if invalido else {nombre: _medida_json(r[clave], unidad)
                       for nombre, (clave, unidad) in definiciones.items()}
-        resultados["chi_cuadrado_reducido"] = {"valor": float(r["redchi"]), "unidad": ""}
-        resultados["chi_cuadrado_sin_piso_de_ruido"] = {
-            "valor": float(r.get("redchi_sin_piso", r["redchi"])), "unidad": ""
-        }
-        resultados["rms_residuo"] = {"valor": float(r.get("rms_residuo", 0.0)), "unidad": "m"}
-        resultados["maximos"] = {
-            nombre: _medida_json(valor, nombre.rpartition("(")[2].rstrip(")"))
-            for nombre, valor in r["maximos"].items()
-        }
-        resultados["energia"] = {nombre: _medida_json(valor, "J")
-                                  for nombre, valor in r["energia"].items()}
+        if not invalido:
+            resultados["chi_cuadrado_reducido"] = {"valor": float(r["redchi"]), "unidad": ""}
+            resultados["chi_cuadrado_sin_piso_de_ruido"] = {"valor": float(r.get("redchi_sin_piso", r["redchi"])), "unidad": ""}
+            resultados["rms_residuo"] = {"valor": float(r.get("rms_residuo", 0.0)), "unidad": "m"}
+            resultados["maximos"] = {nombre: _medida_json(valor, nombre.rpartition("(")[2].rstrip(")")) for nombre, valor in r["maximos"].items()}
+            resultados["energia"] = {nombre: _medida_json(valor, "J") for nombre, valor in r["energia"].items()}
         videos.append({
             "video": r["nombre"],
             "estado": calidad,
+            "motivo": r.get("motivo"),
             "alertas": alertas,
             "seguimiento": {
                 "metodo": seg.get("metodo", "No informado"),
@@ -547,7 +570,7 @@ def resultados_json(res, a=None):
                 "redetecciones": int(seg.get("redetecciones", 0)),
             },
             "ajuste": {
-                "ciclos_observados": float(r["ciclos"]),
+                "ciclos_observados": float(r.get("ciclos", 0)),
                 "cuadros_por_periodo": float(r["muestras_T"]),
                 "sigma_extra_ruido": float(r.get("sigma_extra", 0.0)),
                 "sigma_tracking_px": float(r.get("sigma_tracking_px", 0.0)),
@@ -565,6 +588,7 @@ def resultados_json(res, a=None):
         "version_formato": 2,
         "descripcion": "Análisis de oscilaciones de un resorte. Incertidumbre en las unidades de cada magnitud.",
         "cantidad_videos_analizados": len(res),
+        "cantidad_videos_validos": sum(r.get("estado", "revisar") == "aceptable" for r in res),
         "advertencias": advertencias,
         "videos": videos,
     }
@@ -608,7 +632,7 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
         else "final del registro"
     )
     L = ["# Análisis del resorte: resultados", "", "## Resumen", "",
-         f"- Videos analizados correctamente: **{len(res)}**",
+         f"- Videos analizados: **{len(res)}** ({sum(r.get('estado') == 'aceptable' for r in res)} válidos para el agregado)",
          f"- Videos con errores: **{len(fallidos)}**",
          f"- Masa colgante: **{fmt(ufloat(a.masa, a.sigma_masa), 'kg')}**",
          f"- Masa del resorte: **{fmt(ufloat(a.masa_resorte, a.sigma_masa_resorte), 'kg')}**",
@@ -626,8 +650,12 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
         L += ["| Video | Estado | Período T (s) | Frecuencia angular ω (rad/s) | Amortiguamiento γ (1/s) | k con masa efectiva (N/m) | k sin masa efectiva (N/m) |",
               "|---|---|---:|---:|---:|---:|---:|"]
         for r in res:
-            estado = "Aceptable" if r.get("estado", estado_video(r)) == "aceptable" else "Revisar"
-            L.append(f"| {r['nombre']} | {estado} | {fmt(r['T'])} | {fmt(r['omega'])} | {fmt(r['gamma'])} | {fmt(r['k'])} | {fmt(r['k_sin'])} |")
+            estado = r.get("estado", estado_video(r))
+            etiqueta = {"aceptable": "Aceptable", "revisar": "Revisar", "invalido": "Inválido"}.get(estado, estado)
+            if estado == "invalido":
+                L.append(f"| {r['nombre']} | {etiqueta} | — | — | — | — | — |")
+            else:
+                L.append(f"| {r['nombre']} | {etiqueta} | {fmt(r['T'])} | {fmt(r['omega'])} | {fmt(r['gamma'])} | {fmt(r['k'])} | {fmt(r['k_sin'])} |")
 
         L += ["", "## Seguimiento de la pesa", "",
               "El ajuste descarta los cuadros sin detección. Si son muchos, la incertidumbre real "
@@ -639,6 +667,23 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
               "| Video | Método | Cuadros | Detectados | Perdidos | Perdidos (%) | Inicio auto (s) | Inicio usado (s) | Origen | Fin (s) | Perdidos en el tramo (%) | Eje | Varios candidatos | Saltos descartados |",
               "|---|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---|---:|---:|"]
         for r in res:
+            if r.get("estado") == "invalido":
+                s = r.get("seguimiento", {})
+                n = int(s.get("cuadros", 0))
+                nd = int(s.get("detectados", n - round(r["perdidos"] * n)))
+                info = r.get("inicio_info", {})
+                origen = r.get("inicio_origen", "automático")
+                razon_inicio = info.get("motivo", "")
+                if razon_inicio:
+                    origen += f" ({razon_inicio})"
+                L.append(
+                    f"| {r['nombre']} | {s.get('metodo', 'No informado')} | {n} | {nd} | "
+                    f"{n-nd} | {100*r['perdidos']:.1f} % | {r.get('inicio_auto_s', 0.0):.3f} | "
+                    f"{r.get('inicio_s', 0.0):.3f} | {origen} | {r.get('fin_s', 0.0):.3f} | "
+                    f"{100*r.get('perdidos_analisis', r['perdidos']):.1f} % | {r.get('eje', '—')} | "
+                    f"{s.get('frames_con_multiples_candidatos', 0)} | {s.get('saltos_descartados', 0)} |"
+                )
+                continue
             s = r.get("seguimiento", {})
             n = int(s.get("cuadros", 0))
             nd = int(s.get("detectados", n - round(r["perdidos"] * n)))
@@ -656,12 +701,15 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
               "| Video | χ² reducido | χ² sin piso de ruido | RMS residual (px) | σ extra (px) | Ciclos observados | Cuadros por período | FPS usado | Origen del FPS |",
               "|---|---:|---:|---:|---:|---:|---:|---:|---|"]
         for r in res:
+            if r.get("estado") == "invalido":
+                L.append(f"| {r['nombre']} | — | — | — | — | {r.get('ciclos', 0):.2f} | — | — | — |")
+                continue
             rms_px = float(r.get("rms_residuo", 0.0)) * escala[0]
             sigma_px = float(r.get("sigma_extra", 0.0)) * escala[0]
             L.append(f"| {r['nombre']} | {r['redchi']:.3g} | {r.get('redchi_sin_piso', r['redchi']):.3g} | "
                      f"{rms_px:.3g} | {sigma_px:.3g} | {r['ciclos']:.2f} | {r['muestras_T']:.1f} | "
                      f"{r['fps_uso']:.4g} fps | {r['fps_origen']} |")
-        L += ["", "Como guía, el estado aceptable requiere hasta 5 % de cuadros perdidos en el tramo analizado, "
+        L += ["", "Como guía, el estado aceptable requiere hasta 5 % de cuadros perdidos en el tramo analizado; más de 30 % de pérdidas, menos de 5 ciclos o un ajuste singular da estado Inválido. "
               "χ² reducido entre 0.3 y 3 y al menos 5 ciclos. El χ² usa un piso de ruido estimado del "
               "residual; el valor sin piso se incluye para comparar con el criterio anterior.", "",
               "## Resultado combinado de las repeticiones", "",
@@ -681,14 +729,18 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
                 L.append(f"| {nombre} ({unidad}) | {v['media']:.6g} | {v['est']:.3g} | {v['sis']:.3g} | {v['tot']:.3g} |")
             if len(validos) < len(res):
                 L += ["", f"Se excluyeron {len(res) - len(validos)} repetición(es) por estado Revisar."]
-        L += ["", "## Otros resultados del primer video", "", "### Máximos calculados", ""]
-        L.extend(f"- **{nombre}:** {fmt(valor)}" for nombre, valor in res[0]["maximos"].items())
-        L += ["", "### Energías", "", "| Magnitud | Resultado |", "|---|---:|"]
-        L.extend(f"| {nombre} | {fmt(valor)} |" for nombre, valor in res[0]["energia"].items())
-        claves = list(res[0]["comp"])
+        primer_valido = next((r for r in res if r.get("estado") != "invalido"), None)
+        if primer_valido:
+            L += ["", "## Otros resultados del primer video válido", "", "### Máximos calculados", ""]
+            L.extend(f"- **{nombre}:** {fmt(valor)}" for nombre, valor in primer_valido["maximos"].items())
+            L += ["", "### Energías", "", "| Magnitud | Resultado |", "|---|---:|"]
+            L.extend(f"| {nombre} | {fmt(valor)} |" for nombre, valor in primer_valido["energia"].items())
+        claves = list(primer_valido["comp"]) if primer_valido else []
         L += ["", f"## Señal cruda frente a filtrada (ventana {a.ventana})", "",
               "| Video | " + " | ".join(claves) + " |", "|---|" + "---|" * len(claves)]
         for r in res:
+            if r.get("estado") == "invalido":
+                continue
             celdas = [fmt(r["comp"][k]) if hasattr(r["comp"][k], "n") else f"{r['comp'][k]:.4f}" for k in claves]
             L.append(f"| {r['nombre']} | " + " | ".join(celdas) + " |")
         if k_e is not None and agregados is not None:
@@ -702,6 +754,9 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
 
     limitaciones = []
     for r in res:
+        if r.get("estado") == "invalido":
+            limitaciones.append(f"{r['nombre']}: estado Inválido; {r.get('motivo', 'no cumple criterios de validez')}.")
+            continue
         perdidos_analisis = r.get("perdidos_analisis", r["perdidos"])
         if perdidos_analisis > .05:
             limitaciones.append(
@@ -776,6 +831,10 @@ def main():
                     help="punto inicial por video: --punto NOMBRE X Y (repetible). "
                          "El formato antiguo --punto X Y se aplica a todos y avisa.")
     ap.add_argument("--puntos", help="JSON {video: [x,y]} con un punto inicial por video")
+    ap.add_argument("--desde", type=float, default=None,
+                    help="instante (s) desde el que empieza el tracking; requiere punto en ese cuadro")
+    ap.add_argument("--t-punto", type=float, default=None,
+                    help="instante (s) del punto inicial; equivalente a --desde")
     ap.add_argument("--trayectoria", action="append", default=[], metavar="CSV",
                     help="reanalizar un CSV de trayectoria ya guardado (repetible); "
                          "lee el JSON de metadatos que lo acompaña")
@@ -849,6 +908,10 @@ def main():
         print("ADVERTENCIA: " + aviso)
 
     puntos_nombrados = cargar_puntos_json(a.puntos) if a.puntos else {}
+    instantes_nombrados = cargar_instantes_json(a.puntos) if a.puntos else {}
+    instante_global = a.desde if a.desde is not None else a.t_punto
+    if a.desde is not None and a.t_punto is not None and abs(a.desde-a.t_punto) > 1e-9:
+        ap.error("--desde y --t-punto deben indicar el mismo instante")
     punto_global = None
     for grupo in a.punto or []:
         if len(grupo) == 2:
@@ -866,14 +929,17 @@ def main():
         else:
             ap.error("--punto espera NOMBRE X Y (por video) o X Y (global)")
     puntos_video, claves_usadas, advertencias_video = {}, set(), {}
+    instantes_video = {}
     for video in a.videos:
         punto, clave = resolver_punto(puntos_nombrados, video)
         if punto is not None:
             puntos_video[video] = punto
             claves_usadas.add(clave)
+            instantes_video[video] = instantes_nombrados.get(clave, instante_global or 0.0)
             continue
         if punto_global is not None:
             puntos_video[video] = punto_global
+            instantes_video[video] = instante_global or 0.0
             aviso = (
                 f"{os.path.basename(video)} no tiene un punto propio; "
                 "se usa el --punto global. Verificá que el punto pertenezca a ese video."
@@ -882,6 +948,7 @@ def main():
             print("ADVERTENCIA: " + aviso)
         else:
             puntos_video[video] = None
+            instantes_video[video] = 0.0
             aviso = (
                 f"{os.path.basename(video)} no tiene punto inicial; "
                 "se usará MOG2. Para el seguimiento por punto usá --punto NOMBRE X Y."
@@ -912,7 +979,8 @@ def main():
     res, fallidos = [], []
     for v in a.videos:
         try:
-            resultado = analizar(v, a, escala, a.salidas, punto_inicial=puntos_video.get(v))
+            resultado = analizar(v, a, escala, a.salidas, punto_inicial=puntos_video.get(v),
+                                 desde_s=instantes_video.get(v, 0.0))
             resultado["advertencias"] = advertencias_video.get(v, [])
             res.append(resultado)
             print(f"OK  {v}")

@@ -84,3 +84,7 @@ fps real medido con LED:
 >Si la detección falla o se pega a otras cosas, los rangos HSV de COLORES son el primer lugar a ajustar. Con --ver ves enseguida si engancha el objeto correcto.
 Los colores saturados (rojo, verde, azul) funcionan mejor que el negro o el blanco. Pinten o pongan una marca de color fuerte sobre la masa.
 Si hay otros objetos del mismo color en la imagen (ropa, carteles), el filtro del contorno más grande puede engancharse al equivocado. Cuiden el fondo.
+
+### Rastreo desde un instante
+
+--desde T inicia la trayectoria en el cuadro correspondiente al instante T en segundos. Debe incluir un punto marcado en ese instante: --punto VIDEO X Y --desde T (o --t-punto T). Los cuadros anteriores no forman parte del CSV. Para varios videos, los objetos de --puntos pueden incluir punto: [x, y] y t_punto_s: T; los formatos anteriores siguen iniciando en t=0. La app ofrece el campo Instante del clic (s) por video y muestra el cuadro de ese instante.

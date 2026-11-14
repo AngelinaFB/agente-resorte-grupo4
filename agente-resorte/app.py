@@ -51,7 +51,7 @@ def responder_chat_inicial(mensaje):
             ]
             if faltantes:
                 pendientes.append(
-                    "marcar la masa en el primer cuadro de cada video: "
+                    "marcar la masa en el instante elegido de cada video: "
                     + ", ".join(faltantes)
                 )
 
@@ -157,7 +157,23 @@ with analizador_col:
             return cv2.cvtColor(cuadro, cv2.COLOR_BGR2RGB), (ancho, alto)
 
 
-    def crear_video_tracking(contenido, nombre, punto_inicial, progreso=None):
+    @st.cache_data(show_spinner=False)
+    def cuadro_video_en_t(contenido, nombre, instante_s):
+        with tempfile.TemporaryDirectory(prefix="resorte-vista-t-") as temp_dir:
+            ruta = Path(temp_dir) / Path(nombre).name
+            ruta.write_bytes(contenido)
+            captura = cv2.VideoCapture(str(ruta))
+            captura.set(cv2.CAP_PROP_POS_MSEC, max(0.0, float(instante_s)) * 1000)
+            ok, cuadro = captura.read()
+            ancho = int(captura.get(cv2.CAP_PROP_FRAME_WIDTH))
+            alto = int(captura.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            captura.release()
+            if not ok:
+                return None, None
+            return cv2.cvtColor(cuadro, cv2.COLOR_BGR2RGB), (ancho, alto)
+
+
+    def crear_video_tracking(contenido, nombre, punto_inicial, progreso=None, desde_s=0.0):
         """Genera una previsualización mp4 del seguimiento elegido."""
         with tempfile.TemporaryDirectory(prefix="resorte-tracking-") as temp_dir:
             ruta_video = Path(temp_dir) / Path(nombre).name
@@ -188,6 +204,7 @@ with analizador_col:
                     progreso=progreso,
                     frame_callback=escritor.write,
                     punto_inicial=punto_inicial,
+                    desde_s=desde_s,
                 )
             finally:
                 escritor.release()
@@ -301,7 +318,7 @@ with analizador_col:
         )
         usar_punto_tracking = metodo_tracking == METODO_PUNTO
         algoritmo_tracking = (
-            "punto-inicial-flujo-optico-v5" if usar_punto_tracking else "mog2-v1"
+            "punto-inicial-flujo-optico-v6-desde" if usar_punto_tracking else "mog2-v1"
         )
         col_video, col_boton = st.columns([3, 1])
         indice_tracking = col_video.selectbox(
@@ -311,15 +328,19 @@ with analizador_col:
             key="indice_video_tracking",
         )
         video_seleccionado = videos[indice_tracking]
-        cuadro_tracking, tamano_tracking = primer_cuadro_video(
-            video_seleccionado.getvalue(), video_seleccionado.name
-        )
+        clave_t_punto = f"instante_punto_{video_seleccionado.file_id}"
         clave_punto = f"punto_tracking_{video_seleccionado.file_id}"
+        instante_punto = st.number_input("Instante del clic (s)", min_value=0.0, value=0.0,
+                                         step=0.1, key=clave_t_punto,
+                                         on_change=lambda k=clave_punto: st.session_state.pop(k, None))
+        cuadro_tracking, tamano_tracking = cuadro_video_en_t(
+            video_seleccionado.getvalue(), video_seleccionado.name, instante_punto
+        )
         if cuadro_tracking is None or tamano_tracking is None:
-            st.error("No se pudo leer el primer cuadro del video para preparar el seguimiento.")
+            st.error(f"No se pudo leer el cuadro de t={instante_punto:g} s para preparar el seguimiento.")
         elif usar_punto_tracking:
             st.caption(
-                "Hacé clic en el punto exacto de la masa en el primer cuadro. "
+                f"Hacé clic en el punto exacto de la masa en el cuadro de t = {instante_punto:g} s. "
                 "El seguimiento arranca en ese píxel y continúa por flujo óptico, sin buscar el color rojo."
             )
             ok, imagen_jpeg = cv2.imencode(
@@ -381,12 +402,13 @@ with analizador_col:
 
         if usar_punto_tracking:
             sin_punto_propio = [
-                video.name for video in videos
+                f"{video.name} (t={float(st.session_state.get('instante_punto_' + video.file_id, 0.0)):g} s)"
+                for video in videos
                 if not isinstance(st.session_state.get(f"punto_tracking_{video.file_id}"), dict)
             ]
             if sin_punto_propio:
                 st.warning(
-                    "Falta marcar la masa en el primer cuadro de: "
+                    "Falta marcar la masa en el instante elegido de: "
                     + ", ".join(sin_punto_propio)
                     + ". Cada video debe tener su propio punto; no se reutiliza el punto de otro video."
                 )
@@ -417,6 +439,7 @@ with analizador_col:
                         video_seleccionado.name,
                         punto_inicial=(punto_tracking if usar_punto_tracking else None),
                         progreso=actualizar_progreso_tracking,
+                        desde_s=instante_punto,
                     )
                 st.session_state["vista_tracking"] = {
                     "firma": firma_videos,
@@ -425,6 +448,7 @@ with analizador_col:
                     "algoritmo": algoritmo_tracking,
                     "metodo_tracking": metodo_tracking,
                     "punto_inicial": punto_tracking if usar_punto_tracking else None,
+                    "instante_punto_s": float(instante_punto),
                     "video": video_tracking,
                     "resumen": preanalisis_tracking["seguimiento"],
                     "preanalisis": preanalisis_tracking,
@@ -442,6 +466,7 @@ with analizador_col:
             and vista_tracking.get("algoritmo") == algoritmo_tracking
             and vista_tracking.get("metodo_tracking") == metodo_tracking
             and vista_tracking.get("punto_inicial") == (punto_tracking if usar_punto_tracking else None)
+            and vista_tracking.get("instante_punto_s", 0.0) == float(instante_punto)
         ):
             resumen = vista_tracking["resumen"]
             if vista_tracking.get("video"):
@@ -659,6 +684,7 @@ with analizador_col:
                         estado_progreso.info(f"Analizando video {index + 1} de {len(rutas)}: {Path(ruta).name}")
                         video_actual = videos[index]
                         guardado = st.session_state.get(f"punto_tracking_{video_actual.file_id}")
+                        instante_video = float(st.session_state.get(f"instante_punto_{video_actual.file_id}", 0.0))
                         if not usar_punto_tracking:
                             punto_video = None
                         elif isinstance(guardado, dict):
@@ -679,7 +705,7 @@ with analizador_col:
                         try:
                             if usar_punto_tracking and punto_video is None:
                                 raise ValueError(
-                                    f"{video_actual.name}: falta marcar la masa en el primer cuadro; "
+                                    f"{video_actual.name}: falta marcar la masa en el cuadro de t={instante_video:g} s; "
                                     "cada video debe tener su propio punto de tracking."
                                 )
                             preanalisis = None
@@ -691,6 +717,7 @@ with analizador_col:
                                 and vista_actual.get("algoritmo") == algoritmo_tracking
                                 and vista_actual.get("metodo_tracking") == metodo_tracking
                                 and vista_actual.get("punto_inicial") == punto_video
+                                and vista_actual.get("instante_punto_s", 0.0) == instante_video
                             ):
                                 preanalisis = vista_actual.get("preanalisis")
                             resultados.append(analizar(
@@ -701,6 +728,7 @@ with analizador_col:
                                 progreso=actualizar_progreso,
                                 punto_inicial=punto_video,
                                 preanalisis=preanalisis,
+                                desde_s=instante_video,
                             ))
                         except Exception as exc:
                             fallidos.append((Path(ruta).name, str(exc)))
