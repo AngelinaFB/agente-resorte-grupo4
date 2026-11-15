@@ -15,7 +15,8 @@ with st.spinner("Cargando herramientas del analizador…", show_time=True):
     import streamlit.components.v1 as components
 
     from calibracion import escala_px_por_m
-    from main import analizar, escribir_informe, resultados_json, variables_comunes
+    from main import (advertencias_comunes, analizar, escribir_informe,
+                      resultados_json, variables_comunes)
     from ajuste import k_estatico
     from tracking import trackear
 
@@ -40,8 +41,8 @@ def responder_chat_inicial(mensaje):
     cantidad = len(videos_actuales)
     if any(palabra in texto for palabra in ("falta", "necesito", "dato", "empez", "analiz")):
         metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
-        masa = st.session_state.get("masa_analisis", 0.250)
-        masa_resorte = st.session_state.get("masa_resorte_analisis", 0.030)
+        masa = st.session_state.get("masa_analisis_g", 64.55)
+        masa_resorte = st.session_state.get("masa_resorte_analisis_g", 9.73)
         regla = st.session_state.get("longitud_regla", 0.300)
         pendientes = []
         if metodo == "Punto marcado · flujo óptico":
@@ -57,8 +58,8 @@ def responder_chat_inicial(mensaje):
 
         respuesta = (
             f"Veo {cantidad} video(s). El método seleccionado es «{metodo}». "
-            f"El formulario tiene masa colgante = {masa:g} kg, masa del resorte = "
-            f"{masa_resorte:g} kg y longitud de regla = {regla:g} m. "
+            f"El formulario tiene masa colgante = {masa:g} g, masa del resorte = "
+            f"{masa_resorte:g} g y longitud de regla = {regla:g} m. "
             "Revisá que estos valores coincidan con tus mediciones reales y que las "
             "coordenadas de los extremos de la regla estén bien indicadas."
         )
@@ -491,25 +492,32 @@ with analizador_col:
 
     st.subheader("Datos del experimento")
     c_masa, c_sigma, c_resorte, c_sigma_resorte, _ = st.columns([1.1, 1.1, 1.1, 1.1, 2.5])
-    masa = c_masa.number_input(
-        "Masa colgante (kg)", min_value=0.000001, value=0.250, step=0.010,
-        key="masa_analisis",
-        help="Masa total que cuelga del resorte, incluido el portapesas.",
+    masa_g = c_masa.number_input(
+        "Masa colgante (g)", min_value=0.001, value=64.55, step=0.01, format="%.3f",
+        key="masa_analisis_g",
+        help="Masa total que cuelga del resorte, incluido el portapesas, en gramos.",
     )
-    sigma_masa = c_sigma.number_input(
-        "Incerteza de masa (kg)", min_value=0.0, value=0.001, step=0.001,
-        help="Incerteza de la masa colgante según la resolución de la balanza o la medición usada.",
+    sigma_masa_g = c_sigma.number_input(
+        "Incerteza de masa (g)", min_value=0.0, value=0.014, step=0.001, format="%.3f",
+        help="Incerteza de la masa colgante en gramos, según la balanza o la medición usada.",
     )
-    masa_resorte = c_resorte.number_input(
-        "Masa del resorte (kg)", min_value=0.0, value=0.030, step=0.001,
-        key="masa_resorte_analisis",
-        help="Se considera con factor 1/3 en la masa efectiva.",
+    masa_resorte_g = c_resorte.number_input(
+        "Masa del resorte (g)", min_value=0.0, value=9.73, step=0.01, format="%.3f",
+        key="masa_resorte_analisis_g",
+        help="Masa del resorte en gramos. Se considera con factor 1/3 en la masa efectiva.",
     )
-    sigma_masa_resorte = c_sigma_resorte.number_input(
-        "Incerteza del resorte (kg)", min_value=0.0, value=0.0001, step=0.0001, format="%.4f",
-        help="Incerteza de la masa del resorte según la resolución de la balanza o la medición usada.",
+    sigma_masa_resorte_g = c_sigma_resorte.number_input(
+        "Incerteza del resorte (g)", min_value=0.0, value=0.010, step=0.001, format="%.3f",
+        help="Incerteza de la masa del resorte en gramos, según la balanza o la medición usada.",
     )
-    st.caption(f"Masa colgante: {masa*1000.0:.1f} g")
+    masa = masa_g / 1000.0
+    sigma_masa = sigma_masa_g / 1000.0
+    masa_resorte = masa_resorte_g / 1000.0
+    sigma_masa_resorte = sigma_masa_resorte_g / 1000.0
+    st.caption(
+        f"Masa colgante: {masa_g:.3f} g = {masa:.6f} kg · "
+        f"Resorte: {masa_resorte_g:.3f} g = {masa_resorte:.6f} kg"
+    )
 
     with st.form("parametros_analisis"):
         with st.container(border=True):
@@ -652,8 +660,14 @@ with analizador_col:
                     masas_estaticas=masas_estaticas,
                     elongaciones=elongaciones,
                     fps_led_aviso=None,
+                    residuo_max_pct=8.0,
+                    escala=escala,
+                    escala_origen="regla marcada con clics",
                 )
                 args.masa_u, args.masa_resorte_u, args.corr_fps = variables_comunes(args)
+                for aviso in advertencias_comunes(args):
+                    print("ADVERTENCIA: " + aviso)
+                    st.warning(aviso)
                 k_e = (
                     k_estatico(
                         masas_estaticas,
@@ -720,7 +734,7 @@ with analizador_col:
                                 and vista_actual.get("instante_punto_s", 0.0) == instante_video
                             ):
                                 preanalisis = vista_actual.get("preanalisis")
-                            resultados.append(analizar(
+                            resultado = analizar(
                                 ruta,
                                 args,
                                 escala,
@@ -729,7 +743,10 @@ with analizador_col:
                                 punto_inicial=punto_video,
                                 preanalisis=preanalisis,
                                 desde_s=instante_video,
-                            ))
+                            )
+                            for aviso in resultado.get("advertencias", []):
+                                print("ADVERTENCIA: " + aviso)
+                            resultados.append(resultado)
                         except Exception as exc:
                             fallidos.append((Path(ruta).name, str(exc)))
                         porcentaje_video = int(95 * (index + 1) / len(rutas))
@@ -741,7 +758,7 @@ with analizador_col:
                     escribir_informe(resultados, fallidos, args, escala, k_e, str(informe_path))
                     json_path = salidas_dir / "resultados.json"
                     json_path.write_text(
-                        json.dumps(resultados_json(resultados, args), indent=2, ensure_ascii=False),
+                        json.dumps(resultados_json(resultados, args, escala), indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
                     archivos = {
@@ -783,26 +800,48 @@ with analizador_col:
                 r = video["resultados"]
                 seg = video["seguimiento"]
 
-                def mostrar(nombre):
-                    m = r[nombre]
-                    valor = f"{m['valor']:.5g}"
-                    if "incerteza" in m:
-                        valor += f" ± {m['incerteza']:.2g}"
-                    return f"{valor} {m.get('unidad', '')}".strip()
+                def mostrar_medida(medida):
+                    if not medida:
+                        return "—"
+                    valor = f"{medida['valor']:.5g}"
+                    if "incerteza" in medida:
+                        valor += f" ± {medida['incerteza']:.2g}"
+                    return f"{valor} {medida.get('unidad', '')}".strip()
 
+                def mostrar(nombre):
+                    return mostrar_medida(r.get(nombre))
+
+                etiquetas_estado = {
+                    "aceptable": "Aceptable", "revisar": "Revisar", "invalido": "Inválido"
+                }
+                ajuste = video.get("ajuste", {})
+                t_cruces = ajuste.get("T_cruces_s")
+                rms_pct = ajuste.get("rms_residuo_pct_amplitud")
                 filas_resumen.append({
                     "Video": video["video"],
-                    "Estado": "Revisar" if video["estado"] == "revisar" else "Aceptable",
+                    "Estado": etiquetas_estado.get(video["estado"], video["estado"]),
+                    "Estado anterior": etiquetas_estado.get(video.get("estado_anterior"), video.get("estado_anterior")),
                     "Método": seg.get("metodo", "No informado"),
                     "Seguimiento": f"{seg['cuadros_detectados']}/{seg['cuadros_totales']} cuadros",
                     "Período T": mostrar("periodo"),
+                    "T cruces (s)": "—" if t_cruces is None else f"{t_cruces:.6f}",
+                    "RMS/A (%)": "—" if rms_pct is None else f"{rms_pct:.2f}",
                     "Frecuencia angular ω": mostrar("frecuencia_angular"),
                     "Amortiguamiento γ": mostrar("amortiguamiento"),
                     "Amplitud": mostrar("amplitud"),
+                    "x_eq esperada": mostrar_medida(video.get("extension_estatica_esperada")),
                     "k con masa efectiva": mostrar("constante_elastica_con_masa_efectiva"),
                 })
             if filas_resumen:
                 st.dataframe(filas_resumen, hide_index=True, use_container_width=True)
+            escala_json = datos.get("escala")
+            if escala_json:
+                st.caption(
+                    f"Escala: {escala_json['valor']:.6g} ± {escala_json['sigma']:.3g} px/m "
+                    f"(origen: {escala_json['origen']})."
+                )
+            for aviso in datos.get("advertencias", []):
+                st.warning(aviso)
             for video in datos.get("videos", []):
                 if video.get("alertas"):
                     st.warning(f"{video['video']}: " + "; ".join(video["alertas"]))
