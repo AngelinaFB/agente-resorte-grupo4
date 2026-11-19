@@ -1,26 +1,53 @@
 # agente-resorte-grupo4
 
-## Agente bibliográfico
+## Ejecutar la aplicación en Windows
 
-El código de búsqueda bibliográfica está en `agente-resorte/chatbot`. Cada integrante prepara sus datos locales desde los PDF fuente; las instrucciones para instalar dependencias, Ollama y BGE-M3 y construir los índices están en [agente-resorte/chatbot/README.md](agente-resorte/chatbot/README.md). En Windows, el flujo completo se inicia con `agente-resorte/setup-chatbot.ps1`.
+Requisitos: Python 3.10 o posterior e Internet para la preparación inicial. Abrí PowerShell en la carpeta raíz del repositorio y ejecutá:
+
+```powershell
+cd .\agente-resorte
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Set-ExecutionPolicy -Scope Process Bypass
+.\setup-chatbot.ps1
+```
+
+`setup-chatbot.ps1` instala las dependencias del chatbot, instala Ollama si hace falta, descarga BGE-M3 y prepara el índice y los embeddings locales desde los PDF. La descarga y la preparación pueden tardar. Hay que completar este paso para que el chat responda consultas bibliográficas; el analizador de videos puede ejecutarse sin el índice bibliográfico.
+
+Para que el chat también genere respuestas con Qwen, al terminar el setup ejecutá:
+
+```powershell
+ollama pull qwen2.5:7b
+```
+
+Sin Qwen, el backend puede mostrar citas textuales verificadas, pero no generar una respuesta normal con el modelo. Cada integrante prepara estos datos localmente; no se suben los modelos ni las bases al repositorio. Más detalles en [agente-resorte/chatbot/README.md](agente-resorte/chatbot/README.md).
+
+### Iniciar Streamlit
+
+Desde la carpeta `agente-resorte`:
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run .\app.py
+```
+
+Para reconstruir el índice después de cambiar los PDF, ejecutá `.setup-chatbot.ps1 -RebuildIndex` desde esa misma carpeta.
 
 ## DATOS DE LA ESTRUCTURA GENERAL ##
 
 En `agente-resorte/requirements.txt` están las dependencias:
 instalación
 ```
-cd agente-resorte
-pip install -r requirements.txt
+cd .\agente-resorte
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 > Sin internet: `pip download -r requirements.txt -d wheels/` y luego `pip install --no-index --find-links wheels/ -r requirements.txt`.
 
 ## INTERFAZ PARA ANALIZAR VIDEOS
 
-Desde la carpeta `agente-resorte`, instalá las dependencias y arrancá la interfaz:
+Desde la carpeta `agente-resorte`, arrancá la interfaz:
 ```
-pip install -r requirements.txt
-python -m streamlit run app.py
+.\.venv\Scripts\python.exe -m streamlit run .\app.py
 ```
 
 En la página podés subir una o varias repeticiones, ingresar las masas y elegir el eje y

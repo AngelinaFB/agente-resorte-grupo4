@@ -1,7 +1,9 @@
 import base64
 import io
 import json
+import re
 import tempfile
+import unicodedata
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,10 +15,12 @@ with st.spinner("Cargando herramientas del analizador…", show_time=True):
     import cv2
     import numpy as np
     import streamlit.components.v1 as components
+    from uncertainties import ufloat
 
     from calibracion import escala_px_por_m
-    from main import (advertencias_comunes, analizar, escribir_informe,
-                      resultados_json, variables_comunes)
+    from main import (advertencias_comunes, analizar, diagnosticar_trayectoria,
+                      preanalizar_video, escribir_informe, resultados_json,
+                      variables_comunes)
     from ajuste import k_estatico
     from tracking import trackear
 
@@ -29,68 +33,850 @@ def alternar_ampliacion_selector(clave):
     st.session_state[clave] = not st.session_state.get(clave, False)
 
 
-def responder_chat_inicial(mensaje):
-    texto = mensaje.lower()
-    videos_actuales = st.session_state.get("videos_experimento") or []
-    if not videos_actuales:
-        return (
-            "Primero cargá el video desde el panel «Analizador de video». "
-            "Cuando lo subas, puedo revisar el estado de los datos del experimento."
+def _leer_medida_chat(mensaje):
+    """Lee un valor en g (o kg) y una incertidumbre opcional tras el mensaje."""
+    numeros = re.findall(r"(?<![\w.])[+-]?\d+(?:[.,]\d+)?", mensaje)
+    if not numeros:
+        return None
+    valores = [float(valor.replace(",", ".")) for valor in numeros[:2]]
+    unidad = "kg" if re.search(r"\bkg\b", mensaje, re.IGNORECASE) else "g"
+    factor = 1000.0 if unidad == "kg" else 1.0
+    return valores[0] * factor, (valores[1] * factor if len(valores) > 1 else None)
+
+
+def _leer_longitud_chat(mensaje):
+    partes = re.split(r"\s*(?:±|\+/-|\+\-)\s*", mensaje, maxsplit=1)
+    numeros_valor = re.findall(r"(?<![\w.])[+-]?\d+(?:[.,]\d+)?", partes[0])
+    if not numeros_valor:
+        return None
+    valor = float(numeros_valor[0].replace(",", "."))
+
+    def factor_metros(texto):
+        if re.search(r"\bmm\b", texto, re.IGNORECASE):
+            return 0.001
+        if re.search(r"\bcm\b", texto, re.IGNORECASE):
+            return 0.01
+        return 1.0
+
+    unidad_valor = partes[0] if factor_metros(partes[0]) != 1.0 else mensaje
+    valor_m = valor * factor_metros(unidad_valor)
+    sigma_m = None
+    if len(partes) == 2:
+        numeros_sigma = re.findall(r"(?<![\w.])[+-]?\d+(?:[.,]\d+)?", partes[1])
+        if not numeros_sigma:
+            return None
+        sigma = float(numeros_sigma[0].replace(",", "."))
+        unidad_sigma = partes[1] if factor_metros(partes[1]) != 1.0 else unidad_valor
+        sigma_m = sigma * factor_metros(unidad_sigma)
+    return valor_m, sigma_m
+
+
+def _leer_constante_chat(mensaje):
+    numeros = re.findall(r"(?<![\w.])[+-]?\d+(?:[.,]\d+)?", mensaje)
+    if len(numeros) < 2:
+        return None
+    valores = [float(valor.replace(",", ".")) for valor in numeros[:2]]
+    return valores[0], valores[1]
+
+
+def _inferir_masa_colgante_chat(k_n_m, sigma_k, masa_resorte_g, sigma_resorte_g, diagnosticos):
+    ajustes = [dato for dato in diagnosticos if dato.get("estado") != "invalido"]
+    if not ajustes:
+        raise ValueError("No hay ajustes válidos para inferir la masa desde k.")
+    k = ufloat(k_n_m, sigma_k)
+    masa_resorte = ufloat(masa_resorte_g / 1000.0, sigma_resorte_g / 1000.0)
+    masas_estimadas = [
+        k / (dato["omega"] ** 2 + dato["gamma"] ** 2) - masa_resorte / 3.0
+        for dato in ajustes
+    ]
+    if any(masa.n <= 0 for masa in masas_estimadas):
+        raise ValueError(
+            "La k ingresada no es compatible con una masa colgante positiva para todos los videos válidos."
         )
+    promedio = sum(masas_estimadas) / len(masas_estimadas)
+    dispersion = (
+        float(np.std([masa.n for masa in masas_estimadas], ddof=1) / np.sqrt(len(masas_estimadas)))
+        if len(masas_estimadas) > 1 else 0.0
+    )
+    estimacion = ufloat(promedio.n, float(np.hypot(promedio.s, dispersion)))
+    return estimacion
 
-    cantidad = len(videos_actuales)
-    if any(palabra in texto for palabra in ("falta", "necesito", "dato", "empez", "analiz")):
-        metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
-        masa = st.session_state.get("masa_analisis_g", 64.55)
-        masa_resorte = st.session_state.get("masa_resorte_analisis_g", 9.73)
-        regla = st.session_state.get("longitud_regla", 0.300)
-        pendientes = []
-        if metodo == "Punto marcado · flujo óptico":
-            faltantes = [
-                video.name for video in videos_actuales
-                if not st.session_state.get(f"punto_tracking_{video.file_id}")
-            ]
-            if faltantes:
-                pendientes.append(
-                    "marcar la masa en el instante elegido de cada video: "
-                    + ", ".join(faltantes)
-                )
 
-        respuesta = (
-            f"Veo {cantidad} video(s). El método seleccionado es «{metodo}». "
-            f"El formulario tiene masa colgante = {masa:g} g, masa del resorte = "
-            f"{masa_resorte:g} g y longitud de regla = {regla:g} m. "
-            "Revisá que estos valores coincidan con tus mediciones reales y que las "
-            "coordenadas de los extremos de la regla estén bien indicadas."
-        )
-        if pendientes:
-            respuesta += " Para continuar, falta " + " y ".join(pendientes) + "."
-        else:
-            respuesta += " Con esos datos revisados, podés ejecutar el análisis desde el panel."
-        return respuesta
-
+def _firma_ajuste_chat(videos_actuales):
+    metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
     return (
-        "Por ahora puedo revisar el estado de los datos del experimento. Preguntame "
-        "«¿qué datos faltan?»; la interpretación de preguntas de física y la edición "
-        "de parámetros desde el chat quedan para los siguientes pasos."
+        tuple(_clave_tracking_chat(video, metodo) for video in videos_actuales),
+        st.session_state.get("eje_analisis", "auto"),
+        int(st.session_state.get("ventana_analisis", 11)),
     )
 
+
+def _estado_preparacion_chat(videos_actuales):
+    """Devuelve los requisitos de análisis que aún no están listos en la interfaz."""
+    pendientes = []
+    if not videos_actuales:
+        return ["Subí al menos un video en el panel del analizador."]
+
+    puntos_regla = st.session_state.get(
+        f"puntos_regla_{videos_actuales[0].file_id}", []
+    )
+    if len(puntos_regla) != 2:
+        pendientes.append("marcá los dos extremos de la regla en el cuadro de referencia")
+    metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
+    if metodo == "Punto marcado · flujo óptico":
+        faltan_puntos = [
+            video.name for video in videos_actuales
+            if not isinstance(st.session_state.get(f"punto_tracking_{video.file_id}"), dict)
+        ]
+        if faltan_puntos:
+            pendientes.append(
+                "marcá la masa en cada video: " + ", ".join(faltan_puntos)
+            )
+    return pendientes
+
+
+def _vista_tracking_actual(videos_actuales):
+    if not videos_actuales:
+        return None
+    indice = int(st.session_state.get("indice_video_tracking", 0) or 0)
+    if not 0 <= indice < len(videos_actuales):
+        return None
+    video = videos_actuales[indice]
+    metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
+    punto = st.session_state.get(f"punto_tracking_{video.file_id}")
+    punto_inicial = (
+        (punto["x"], punto["y"])
+        if isinstance(punto, dict) and "x" in punto and "y" in punto
+        else None
+    )
+    desde_s = float(st.session_state.get(f"instante_punto_{video.file_id}", 0.0))
+    algoritmo = "punto-inicial-flujo-optico-v6-desde" if metodo == "Punto marcado · flujo óptico" else "mog2-v1"
+    firma = tuple((actual.file_id, actual.name) for actual in videos_actuales)
+    vista = st.session_state.get("vista_tracking")
+    if not vista:
+        return None
+    coincide = (
+        vista.get("firma") == firma
+        and vista.get("indice") == indice
+        and vista.get("metodo_tracking") == metodo
+        and vista.get("algoritmo") == algoritmo
+        and vista.get("punto_inicial") == (punto_inicial if metodo == "Punto marcado · flujo óptico" else None)
+        and vista.get("instante_punto_s", 0.0) == desde_s
+    )
+    return vista if coincide else None
+
+
+def _clave_tracking_chat(video, metodo):
+    punto = st.session_state.get(f"punto_tracking_{video.file_id}")
+    punto_inicial = (
+        (punto["x"], punto["y"])
+        if isinstance(punto, dict) and "x" in punto and "y" in punto
+        else None
+    )
+    return (
+        video.file_id,
+        metodo,
+        punto_inicial if metodo == "Punto marcado · flujo óptico" else None,
+        float(st.session_state.get(f"instante_punto_{video.file_id}", 0.0)),
+    )
+
+
+def _obtener_diagnosticos_chat(videos_actuales):
+    metodo = st.session_state.get("metodo_tracking", "Punto marcado · flujo óptico")
+    cache = st.session_state.setdefault("trayectorias_chat", {})
+    vista = _vista_tracking_actual(videos_actuales)
+    indice_vista = vista.get("indice") if vista else None
+    diagnosticos = []
+    errores_tracking = []
+    ventana = int(st.session_state.get("ventana_analisis", 11))
+    eje = st.session_state.get("eje_analisis", "auto")
+    clave_diagnostico = (
+        tuple(_clave_tracking_chat(video, metodo) for video in videos_actuales),
+        eje,
+        ventana,
+    )
+    if st.session_state.get("clave_diagnosticos_chat") == clave_diagnostico:
+        return st.session_state.get("diagnosticos_chat", []), []
+
+    for indice, video in enumerate(videos_actuales):
+        clave = _clave_tracking_chat(video, metodo)
+        guardado = cache.get(video.file_id)
+        preanalisis = guardado.get("preanalisis") if guardado and guardado.get("clave") == clave else None
+        if preanalisis is None and vista and indice == indice_vista:
+            preanalisis = vista.get("preanalisis")
+        if preanalisis is None:
+            punto = clave[2]
+            instante = clave[3]
+            try:
+                with tempfile.TemporaryDirectory(prefix="resorte-chat-video-") as carpeta:
+                    ruta_video = Path(carpeta) / Path(video.name).name
+                    ruta_video.write_bytes(video.getvalue())
+                    preanalisis = preanalizar_video(
+                        str(ruta_video), punto_inicial=punto, desde_s=instante
+                    )
+            except Exception as exc:
+                errores_tracking.append(f"{video.name}: {exc}")
+                continue
+        cache[video.file_id] = {"clave": clave, "preanalisis": preanalisis}
+        try:
+            diagnostico = diagnosticar_trayectoria(preanalisis, eje=eje, ventana=ventana)
+        except Exception as exc:
+            diagnostico = {
+                "nombre": video.name,
+                "estado": "invalido",
+                "motivo": f"{type(exc).__name__}: {exc}",
+            }
+        diagnosticos.append(diagnostico)
+    st.session_state["diagnosticos_chat"] = diagnosticos
+    if not errores_tracking:
+        st.session_state["clave_diagnosticos_chat"] = clave_diagnostico
+    return diagnosticos, errores_tracking
+
+
+def _resumen_ajuste_chat(diagnosticos):
+    lineas = []
+    for dato in diagnosticos:
+        if dato.get("estado") == "invalido":
+            lineas.append(f"{dato['nombre']}: no se pudo ajustar ({dato.get('motivo', 'ajuste inválido')})")
+            continue
+        T, omega, gamma = dato["T"], dato["omega"], dato["gamma"]
+        lineas.append(
+            f"{dato['nombre']}: T = {T.n:.4g} ± {T.s:.2g} s; "
+            f"ω = {omega.n:.4g} ± {omega.s:.2g} rad/s; "
+            f"γ = {gamma.n:.4g} ± {gamma.s:.2g} 1/s ({dato['estado']})"
+        )
+    return "\n".join(lineas)
+
+
+def _explicar_datos_derivables(vista, diagnosticos=()):
+    texto = (
+        "Con la trayectoria del video, la calibración espacial y el tiempo de cuadro se obtienen "
+        "posición, velocidad y aceleración; el ajuste oscilatorio permite estimar amplitud, "
+        "período y amortiguamiento. Para convertir píxeles a metros hace falta la longitud real de la regla. "
+        "La constante elástica y las energías absolutas requieren además las masas: "
+        "k se calcula con la masa efectiva (masa colgante + un tercio de la masa del resorte) "
+        "y la frecuencia del ajuste."
+    )
+    if diagnosticos:
+        texto += " Ajuste de las trayectorias guardadas:\n" + _resumen_ajuste_chat(diagnosticos)
+    elif vista:
+        resumen = vista.get("resumen", {})
+        detectados = resumen.get("detectados")
+        cuadros = resumen.get("cuadros")
+        perdidos = resumen.get("perdidos")
+        if detectados is not None and cuadros:
+            texto += f" La vista de seguimiento actual detectó {detectados} de {cuadros} cuadros"
+            if perdidos is not None:
+                texto += f" y perdió {perdidos}"
+            texto += "."
+    else:
+        texto += " Todavía no hay una trayectoria guardada; al iniciar el análisis se extraerá una sola vez."
+    return texto
+
+
+def _normalizar_texto_chat(texto):
+    normalizado = unicodedata.normalize("NFD", texto.lower())
+    return "".join(caracter for caracter in normalizado if unicodedata.category(caracter) != "Mn")
+
+
+def _es_pedido_analisis(mensaje):
+    texto = _normalizar_texto_chat(mensaje).strip(" ¿?¡!.,")
+    comandos = {
+        "analizar", "analizar video", "analizar videos", "iniciar analisis",
+        "empezar analisis", "continuar analisis", "que datos faltan",
+        "que necesito para analizar",
+    }
+    if texto in comandos:
+        return True
+    interrogativo = texto.startswith(("como ", "que es ", "por que ", "cual es ", "explicame "))
+    if interrogativo:
+        return False
+    return (
+        "analizar" in texto and any(palabra in texto for palabra in ("video", "analisis", "informe"))
+        or "datos" in texto and ("falta" in texto or "necesito" in texto)
+        and any(palabra in texto for palabra in ("video", "analisis", "analizar"))
+    )
+
+
+def _es_pregunta_bibliografica(mensaje):
+    texto = _normalizar_texto_chat(mensaje).strip()
+    return "?" in mensaje or texto.startswith(
+        ("que ", "como ", "por que ", "cual ", "cuando ", "explicame ", "defini ")
+    )
+
+
+def _analisis_vigente_chat(videos_actuales):
+    """Devuelve solo resultados que coinciden con los datos visibles de la corrida."""
+    analisis = st.session_state.get("ultimo_analisis")
+    firma = analisis.get("firma") if analisis else None
+    if not videos_actuales or not isinstance(firma, tuple) or len(firma) < 16:
+        return None
+
+    identidad_videos = tuple((video.file_id, video.name) for video in videos_actuales)
+    puntos_tracking = tuple(
+        (video.file_id, st.session_state.get(f"punto_tracking_{video.file_id}"))
+        for video in videos_actuales
+    )
+    puntos_regla_guardados = st.session_state.get(
+        f"puntos_regla_{videos_actuales[0].file_id}", []
+    )
+    puntos_regla = (
+        tuple((punto["x"], punto["y"]) for punto in puntos_regla_guardados)
+        if len(puntos_regla_guardados) == 2 else None
+    )
+    usar_sigma_elongacion = bool(st.session_state.get("usar_sigma_elongacion", False))
+    firma_actual = (
+        identidad_videos,
+        st.session_state.get("metodo_tracking"),
+        puntos_tracking,
+        float(st.session_state.get("masa_analisis_g", 64.55)) / 1000.0,
+        float(st.session_state.get("sigma_masa_analisis_g", 0.014)) / 1000.0,
+        float(st.session_state.get("masa_resorte_analisis_g", 9.73)) / 1000.0,
+        float(st.session_state.get("sigma_masa_resorte_analisis_g", 0.010)) / 1000.0,
+        puntos_regla,
+        float(st.session_state.get("longitud_regla", 0.300)),
+        float(st.session_state.get("sigma_longitud_regla_m", 0.0005)),
+        int(st.session_state.get("ventana_analisis", 11)),
+        st.session_state.get("eje_analisis", "auto"),
+        st.session_state.get("masas_estaticas_texto", ""),
+        st.session_state.get("elongaciones_estaticas_texto", ""),
+        usar_sigma_elongacion,
+        (
+            float(st.session_state.get("sigma_elongacion_m", 0.001))
+            if usar_sigma_elongacion else None
+        ),
+    )
+    return analisis if firma[:16] == firma_actual else None
+
+
+def _es_consulta_resultado_chat(mensaje):
+    texto = _normalizar_texto_chat(mensaje).strip(" ¿?¡!.,")
+    if texto.startswith(("que es ", "como se calcula ", "como se define ", "por que ", "explicame ")):
+        return False
+    magnitudes = (
+        "periodo", "frecuencia", "amortiguamiento", "constante elastica", "valor de k",
+        "amplitud", "posicion", "velocidad", "aceleracion", "energia", "energia cinetica",
+        "energia potencial", "energia total", "seguimiento", "tracking", "maximo",
+        "trabajo", "disipacion", "disipativo",
+    )
+    pide_valor = any(palabra in texto for palabra in (
+        "cuanto", "cuanta", "cual", "que valor", "resultado", "me dio", "dio ",
+        "obtuvo", "tuvo", "fue", "salio", "mi analisis", "mi video", "la corrida", "repeticion",
+    ))
+    menciona_magnitud = (
+        any(magnitud in texto for magnitud in magnitudes)
+        or bool(re.search(r"\bk\b", texto))
+        or bool(re.search(r"\bet\b", texto))
+        or "δet" in texto
+    )
+    return menciona_magnitud and (pide_valor or "video" in texto or "corrida" in texto)
+
+
+def responder_chat_resultados(mensaje, analisis):
+    """Contesta con valores literales del JSON de la corrida actual, no de la bibliografía."""
+    datos = analisis.get("resultados") or {}
+    videos = datos.get("videos") or []
+    texto = _normalizar_texto_chat(mensaje)
+    if not videos:
+        return "**Resultados de tu análisis**\nLa corrida actual no tiene resultados por video. Escribí «analizar» para generarlos."
+
+    seleccionado = None
+    numero_video = re.search(r"\bvideo\s*(\d+)\b", texto)
+    if numero_video:
+        indice = int(numero_video.group(1)) - 1
+        if 0 <= indice < len(videos):
+            seleccionado = [videos[indice]]
+    if seleccionado is None:
+        for video in videos:
+            nombre = _normalizar_texto_chat(str(video.get("video", "")))
+            if nombre and nombre in texto:
+                seleccionado = [video]
+                break
+    if seleccionado is None:
+        seleccionado = videos if len(videos) > 1 else [videos[0]]
+
+    def medida(valor):
+        if not isinstance(valor, dict) or "valor" not in valor:
+            return "sin dato"
+        salida = f"{valor['valor']:.5g}"
+        if "incerteza" in valor:
+            salida += f" ± {valor['incerteza']:.2g}"
+        unidad = valor.get("unidad", "")
+        return f"{salida} {unidad}".strip()
+
+    respuestas = []
+    for video in seleccionado:
+        resultado = video.get("resultados") or {}
+        estado = video.get("estado", "sin estado")
+        if estado == "invalido":
+            detalle = video.get("motivo") or "el ajuste no produjo valores confiables"
+            respuestas.append(f"**{video.get('video', 'Video')} · Inválido:** {detalle}.")
+            continue
+
+        metricas = [
+            ("periodo", "Período T"),
+            ("frecuencia_angular", "Frecuencia angular ω"),
+            ("amortiguamiento", "Amortiguamiento γ"),
+            ("constante_elastica_con_masa_efectiva", "Constante elástica k"),
+            ("amplitud", "Amplitud"),
+        ]
+        lineas = []
+        if "periodo" in texto:
+            metricas = [metricas[0]]
+        elif "frecuencia" in texto or "omega" in texto or "ω" in mensaje:
+            metricas = [metricas[1]]
+        elif "amortiguamiento" in texto or "gamma" in texto or "γ" in mensaje:
+            metricas = [metricas[2]]
+        elif "constante elastica" in texto or re.search(r"\bk\b", texto):
+            metricas = [metricas[3]]
+        elif "amplitud" in texto:
+            metricas = [metricas[4]]
+        elif "energia" in texto or re.search(r"\bet\b", texto) or "δet" in texto:
+            metricas = []
+        elif "velocidad" in texto or "aceleracion" in texto or "maximo" in texto or "posicion" in texto:
+            metricas = []
+
+        for clave, etiqueta in metricas:
+            if clave in resultado:
+                lineas.append(f"- {etiqueta}: {medida(resultado[clave])}")
+
+        maximos = resultado.get("maximos") or {}
+        maxima_medida = []
+        if "posicion" in texto or "maximo" in texto:
+            maxima_medida.extend((clave, etiqueta) for clave, etiqueta in maximos.items()
+                                 if "x_max" in clave or "posici" in clave)
+        if "velocidad" in texto or "maximo" in texto:
+            maxima_medida.extend((clave, etiqueta) for clave, etiqueta in maximos.items()
+                                 if "v_max" in clave)
+        if "aceleracion" in texto or "maximo" in texto:
+            maxima_medida.extend((clave, etiqueta) for clave, etiqueta in maximos.items()
+                                 if "a_max" in clave)
+        for clave, etiqueta in maxima_medida:
+            lineas.append(f"- {etiqueta}: {medida(maximos[clave])}")
+
+        energia = resultado.get("energia") or {}
+        consulta_trabajo = any(palabra in texto for palabra in ("trabajo", "disipacion", "disipativo"))
+        if consulta_trabajo:
+            delta = next((clave for clave in energia if "ΔEt" in clave), None)
+            lineas.append(
+                "- El informe no integra el trabajo explícitamente; informa el cambio de energía mecánica."
+                + (f" ΔEt: {medida(energia[delta])}." if delta else "")
+            )
+        if "energia" in texto or re.search(r"\bet\b", texto) or "δet" in texto:
+            terminos_energia = []
+            if "cinetica" in texto:
+                terminos_energia = [clave for clave in energia if "Ec_max" in clave]
+            elif "potencial" in texto:
+                terminos_energia = [clave for clave in energia if "Ep_max" in clave]
+            elif "perdid" in texto or "disipad" in texto or "delta" in texto or "Δet" in mensaje.lower():
+                terminos_energia = [clave for clave in energia if "ΔEt" in clave]
+            elif "total" in texto or "mecanica" in texto or re.search(r"\bet\b", texto):
+                terminos_energia = [clave for clave in energia if "Et " in clave or "ΔEt" in clave]
+            else:
+                terminos_energia = list(energia)
+            lineas.extend(f"- {clave}: {medida(energia[clave])}" for clave in terminos_energia)
+
+        alertas = video.get("alertas") or []
+        if "seguimiento" in texto or "tracking" in texto:
+            seguimiento = video.get("seguimiento") or {}
+            lineas.append(
+                f"- Seguimiento: {seguimiento.get('cuadros_detectados', '?')}/"
+                f"{seguimiento.get('cuadros_totales', '?')} cuadros detectados; estado {estado}."
+            )
+        if alertas:
+            lineas.append("- Alertas del informe: " + "; ".join(str(alerta) for alerta in alertas))
+        if not lineas:
+            lineas = [f"- Estado: {estado}"]
+            lineas.extend(f"- {etiqueta}: {medida(resultado[clave])}" for clave, etiqueta in metricas if clave in resultado)
+        respuestas.append(f"**{video.get('video', 'Video')} · {estado}:**\n" + "\n".join(lineas))
+    return "**Resultados de tu análisis (datos del informe, no bibliografía)**\n\n" + "\n\n".join(respuestas)
+
+
+def responder_chat_bibliografia(pregunta):
+    try:
+        from chatbot.generation import answer_question
+
+        resultado = answer_question(pregunta, limit=8)
+    except (ImportError, ModuleNotFoundError):
+        return (
+            "**Bibliografía de la cátedra**\nNo se pudieron cargar sus dependencias. "
+            "Desde la carpeta `agente-resorte`, ejecutá "
+            "`python -m pip install -r requirements-chatbot.txt`."
+        )
+    except FileNotFoundError:
+        return (
+            "**Bibliografía de la cátedra**\nEl índice bibliográfico local todavía no está preparado. "
+            "Desde PowerShell, en `agente-resorte`, ejecutá el script `setup-chatbot.ps1` y asegurate "
+            "de tener disponibles los PDF de la bibliografía."
+        )
+    except (RuntimeError, ValueError) as exc:
+        return f"**Bibliografía de la cátedra**\nNo pude completar la consulta: {exc}"
+    except Exception as exc:
+        return f"**Bibliografía de la cátedra**\nFalló la consulta ({type(exc).__name__}): {exc}"
+
+    estados = {
+        "respaldada": "respuesta respaldada",
+        "parcial": "respuesta parcial",
+        "sin evidencia suficiente": "evidencia insuficiente",
+    }
+    partes = [
+        f"**Bibliografía de la cátedra · {estados.get(resultado.get('status'), resultado.get('status'))}**",
+        resultado.get("answer", "No se obtuvo una respuesta."),
+    ]
+    referencias = resultado.get("references", [])
+    if referencias:
+        partes.extend(["", "**Fuentes:**"])
+        for referencia in referencias:
+            documento = referencia.get("document") or referencia.get("source_path") or "Documento sin título"
+            pagina = referencia.get("page")
+            detalle_pagina = f"p. {pagina}" if pagina is not None else "página no indicada"
+            partes.append(f"- [{referencia.get('id', '?')}] {documento}, {detalle_pagina}.")
+    if resultado.get("generation_error") and resultado.get("references"):
+        partes.extend([
+            "",
+            "No se pudo usar Ollama; se muestra únicamente una cita textual recuperada y verificada.",
+        ])
+    return "\n".join(partes)
+
+
+def responder_chat_inicial(mensaje):
+    texto = mensaje.strip().lower()
+    videos_actuales = st.session_state.get("videos_experimento") or []
+    firma_videos_chat = tuple(video.file_id for video in videos_actuales)
+    if st.session_state.get("firma_masas_chat") != firma_videos_chat:
+        st.session_state["firma_masas_chat"] = firma_videos_chat
+        st.session_state["paso_datos_chat"] = None
+        st.session_state["masas_confirmadas_chat"] = False
+        st.session_state["longitud_confirmada_chat"] = False
+        st.session_state["modo_datos_dinamica_chat"] = None
+        st.session_state["k_dinamica_chat"] = None
+        st.session_state.pop("masa_origen_chat", None)
+        st.session_state.pop("k_dinamica_ingresada_chat", None)
+        st.session_state.pop("masa_inferida_chat_g", None)
+        st.session_state["masa_resorte_aproximada_chat"] = False
+
+    firma_masa_inferida = st.session_state.get("firma_masa_inferida_chat")
+    if (
+        st.session_state.get("masa_origen_chat") == "inferida desde k dinámica medida"
+        and firma_masa_inferida is not None
+        and firma_masa_inferida != _firma_ajuste_chat(videos_actuales)
+    ):
+        st.session_state["masas_confirmadas_chat"] = False
+        st.session_state["paso_datos_chat"] = None
+        st.session_state["modo_datos_dinamica_chat"] = None
+        st.session_state["k_dinamica_chat"] = None
+        st.session_state.pop("masa_origen_chat", None)
+        st.session_state.pop("k_dinamica_ingresada_chat", None)
+        st.session_state.pop("masa_inferida_chat_g", None)
+
+    firma_regla = None
+    if videos_actuales:
+        puntos_regla = st.session_state.get(
+            f"puntos_regla_{videos_actuales[0].file_id}", []
+        )
+        firma_regla = (
+            videos_actuales[0].file_id,
+            tuple(
+                (punto.get("x"), punto.get("y"))
+                for punto in puntos_regla if isinstance(punto, dict)
+            ),
+        )
+    firma_regla_confirmada = st.session_state.get("firma_regla_confirmada_chat")
+    if firma_regla_confirmada is not None and firma_regla_confirmada != firma_regla:
+        st.session_state["longitud_confirmada_chat"] = False
+        if st.session_state.get("paso_datos_chat") in (
+            "fuente_dinamica", "masa", "k", "masa_resorte", "masa_resorte_k"
+        ):
+            st.session_state["paso_datos_chat"] = None
+
+    paso = st.session_state.get("paso_datos_chat")
+    if paso and any(palabra in texto for palabra in ("cancel", "después", "despues")):
+        st.session_state["paso_datos_chat"] = None
+        return "Dejé el análisis en pausa. Cuando quieras continuar, escribí «analizar»."
+    if _es_consulta_resultado_chat(mensaje):
+        analisis_actual = _analisis_vigente_chat(videos_actuales)
+        if analisis_actual is None:
+            return (
+                "**Resultados de tu análisis**\nNo encuentro una corrida vigente con los datos "
+                "actuales. Escribí «analizar» para generar el informe y después preguntame por "
+                "el período, la amplitud, k o las energías."
+            )
+        return responder_chat_resultados(mensaje, analisis_actual)
+
+    if paso and _es_pregunta_bibliografica(mensaje):
+        return responder_chat_bibliografia(mensaje)
+
+    if paso == "regla":
+        medida_longitud = _leer_longitud_chat(mensaje)
+        if medida_longitud is None:
+            return "No pude leer la longitud. Indicá la distancia en m o cm; podés agregar su incertidumbre, por ejemplo: 30 ± 0,1 cm."
+        longitud_m, sigma_longitud_m = medida_longitud
+        if longitud_m <= 0 or (sigma_longitud_m is not None and sigma_longitud_m < 0):
+            return "La longitud debe ser positiva y su incertidumbre no puede ser negativa."
+        st.session_state["longitud_regla"] = longitud_m
+        if sigma_longitud_m is not None:
+            st.session_state["sigma_longitud_regla_m"] = sigma_longitud_m
+        st.session_state["longitud_confirmada_chat"] = True
+        st.session_state["firma_regla_confirmada_chat"] = firma_regla
+        if st.session_state.get("masas_confirmadas_chat"):
+            st.session_state["paso_datos_chat"] = None
+            st.session_state["analisis_ocupado"] = True
+            return "Anoté la longitud actualizada. Voy a regenerar el informe con la trayectoria guardada, sin volver a seguir el video."
+        st.session_state["paso_datos_chat"] = "fuente_dinamica"
+        ajuste = _resumen_ajuste_chat(st.session_state.get("diagnosticos_chat", []))
+        detalle_incerteza = (
+            f" Usaré una incertidumbre de longitud de {sigma_longitud_m:g} m."
+            if sigma_longitud_m is not None
+            else " Como no indicaste incertidumbre para la longitud, usaré la configurada en el analizador."
+        )
+        return "Anoté la longitud." + detalle_incerteza + " Del ajuste de la trayectoria ya obtuve:\n" + ajuste + "\nPara completar dinámica y energías, elegí qué dato conocés: respondé «masa» si mediste la masa colgante, o «k» si tenés una constante elástica medida independientemente (por ejemplo, con un ensayo estático). Con k y la frecuencia del video puedo estimar la masa faltante."
+
+    if paso == "fuente_dinamica":
+        if "masa" in texto and "resorte" not in texto:
+            st.session_state["modo_datos_dinamica_chat"] = "masa"
+            st.session_state["paso_datos_chat"] = "masa"
+            return "Indicá la masa colgante medida en g o kg. Podés incluir la incertidumbre, por ejemplo: 64,5 ± 0,1 g."
+        if re.search(r"\bk\b", texto) or "constante" in texto or "elastica" in texto or "elástica" in texto:
+            st.session_state["modo_datos_dinamica_chat"] = "k"
+            st.session_state["paso_datos_chat"] = "k"
+            return "Indicá la constante elástica medida en N/m junto con su incertidumbre, por ejemplo: k = 12,4 ± 0,3 N/m."
+        return "Elegí una alternativa: escribí «masa» para ingresar la masa colgante o «k» para ingresar una constante elástica medida."
+
+    if paso == "k":
+        constante = _leer_constante_chat(mensaje)
+        if constante is None or constante[0] <= 0 or constante[1] < 0:
+            return "No pude leer k y su incertidumbre. Usá el formato k = 12,4 ± 0,3 N/m."
+        st.session_state["k_dinamica_chat"] = constante
+        st.session_state["paso_datos_chat"] = "masa_resorte_k"
+        return "Anoté k. Para despejar la masa colgante también necesito la masa del resorte; indicá el valor en g o kg y, si la tenés, su incertidumbre. Si no la conocés, respondé «desconozco» y usaré masa del resorte cero como aproximación."
+
+    if paso in ("masa", "masa_resorte", "masa_resorte_k"):
+        texto_normalizado = _normalizar_texto_chat(mensaje).strip(" .,!¿?")
+        omitir_masa_resorte = (
+            paso in ("masa_resorte", "masa_resorte_k")
+            and texto_normalizado in {
+                "no la se", "la desconozco", "desconozco", "no tengo ese dato",
+                "masa despreciable", "aproximar como despreciable",
+            }
+        )
+        medida = (0.0, 0.0) if omitir_masa_resorte else _leer_medida_chat(mensaje)
+        if (
+            medida is None or medida[0] < 0
+            or (paso == "masa" and medida[0] == 0)
+            or (medida[1] is not None and medida[1] < 0)
+        ):
+            nombre = "masa colgante" if paso == "masa" else "masa del resorte"
+            return f"No pude leer ese valor. Indicá la {nombre} en g o kg; podés agregar ± y la incertidumbre."
+        valor_g, sigma_g = medida
+        if paso == "masa":
+            st.session_state["masa_analisis_g"] = valor_g
+            if sigma_g is not None:
+                st.session_state["sigma_masa_analisis_g"] = sigma_g
+            st.session_state["paso_datos_chat"] = "masa_resorte"
+            return "Anoté la masa colgante. ¿Cuánto pesa el resorte? Respondé en g o kg y podés agregar su incertidumbre con ±. Si no la conocés, respondé «desconozco» y usaré masa del resorte cero como aproximación."
+
+        st.session_state["masa_resorte_analisis_g"] = valor_g
+        if sigma_g is not None:
+            st.session_state["sigma_masa_resorte_analisis_g"] = sigma_g
+        st.session_state["masa_resorte_aproximada_chat"] = omitir_masa_resorte
+        if paso == "masa_resorte_k":
+            k_n_m, sigma_k = st.session_state["k_dinamica_chat"]
+            sigma_resorte = (
+                sigma_g if sigma_g is not None
+                else st.session_state.get("sigma_masa_resorte_analisis_g", 0.010)
+            )
+            try:
+                masa_inferida = _inferir_masa_colgante_chat(
+                    k_n_m, sigma_k, valor_g, sigma_resorte,
+                    st.session_state.get("diagnosticos_chat", []),
+                )
+            except ValueError as exc:
+                return f"No puedo inferir una masa válida: {exc} Revisá k y las masas, o elegí ingresar la masa colgante."
+            st.session_state["masa_analisis_g"] = masa_inferida.n * 1000.0
+            st.session_state["sigma_masa_analisis_g"] = masa_inferida.s * 1000.0
+            st.session_state["masa_inferida_chat_g"] = (
+                masa_inferida.n * 1000.0, masa_inferida.s * 1000.0
+            )
+            st.session_state["masa_origen_chat"] = "inferida desde k dinámica medida"
+            st.session_state["firma_masa_inferida_chat"] = _firma_ajuste_chat(videos_actuales)
+            st.session_state["k_dinamica_ingresada_chat"] = {
+                "valor": k_n_m, "incerteza": sigma_k, "unidad": "N/m"
+            }
+            resultado_masa = (
+                f"Con k y los ajustes del video, la masa colgante estimada es "
+                f"{masa_inferida.n * 1000:.4g} ± {masa_inferida.s * 1000:.2g} g. "
+            )
+        else:
+            st.session_state["masa_origen_chat"] = "ingresada como medición"
+            st.session_state.pop("k_dinamica_ingresada_chat", None)
+            resultado_masa = ""
+        st.session_state["paso_datos_chat"] = None
+        st.session_state["masas_confirmadas_chat"] = True
+        st.session_state["analisis_ocupado"] = True
+        if omitir_masa_resorte:
+            resultado_masa += (
+                "Como no se conoce la masa del resorte, la tomé como cero; esto es una aproximación "
+                "y afecta la masa efectiva, k y las energías. "
+            )
+        return resultado_masa + "Ya tengo los datos. Voy a generar el informe reutilizando las trayectorias guardadas."
+
+    if not _es_pedido_analisis(mensaje):
+        return responder_chat_bibliografia(mensaje)
+
+    pendientes = _estado_preparacion_chat(videos_actuales)
+    vista_tracking = _vista_tracking_actual(videos_actuales)
+    if pendientes:
+        explicacion = _explicar_datos_derivables(vista_tracking)
+        return explicacion + " Para empezar, " + "; además, ".join(pendientes) + ". Cuando esté listo, escribí «analizar» aquí."
+
+    diagnosticos, errores_tracking = _obtener_diagnosticos_chat(videos_actuales)
+    if errores_tracking:
+        return "No pude obtener la trayectoria de todos los videos: " + "; ".join(errores_tracking) + ". Corregí esos puntos o el método de seguimiento y volvé a escribir «analizar»."
+    explicacion = _explicar_datos_derivables(vista_tracking, diagnosticos)
+
+    if not st.session_state.get("longitud_confirmada_chat"):
+        st.session_state["paso_datos_chat"] = "regla"
+        return explicacion + " ¿Qué longitud real hay entre los dos puntos marcados de la regla? Respondé en m o cm, por ejemplo: 30 cm."
+
+    if not st.session_state.get("masas_confirmadas_chat"):
+        st.session_state["paso_datos_chat"] = "fuente_dinamica"
+        return explicacion + " Para completar dinámica y energías, podés ingresar la masa colgante o una k medida independientemente (con incertidumbre); con k y el ajuste del video se puede inferir la masa. ¿Cuál de esos datos tenés?"
+
+    st.session_state["analisis_ocupado"] = True
+    return "Los datos requeridos están cargados. Voy a generar el informe; cada video se seguirá una sola vez y se reutilizará cualquier trayectoria ya guardada."
+
+
+if not st.session_state.get("interfaz_cargada", False):
+    skeleton_interfaz = st.empty()
+    with skeleton_interfaz.container():
+        st.markdown(
+            """
+            <style>
+            .resorte-skeleton-screen {
+                position: fixed;
+                inset: 0;
+                z-index: 999999;
+                display: flex;
+                justify-content: center;
+                overflow-y: auto;
+                padding: 2rem;
+                background: var(--background-color);
+            }
+            .resorte-skeleton-layout {
+                display: grid !important;
+                grid-template-columns: minmax(220px, 1fr) minmax(0, 3fr) !important;
+                gap: 2rem;
+                width: 100%;
+                max-width: 1800px;
+                margin: auto;
+                align-items: start;
+            }
+            .resorte-skeleton-panel {
+                min-width: 0;
+                width: 100%;
+                text-align: left;
+            }
+            .resorte-skeleton-block,
+            .resorte-skeleton-box,
+            .resorte-skeleton-input {
+                background: var(--secondary-background-color);
+                border: 1px solid var(--border-color);
+                border-radius: 0.55rem;
+                animation: resorte-pulse 1.25s ease-in-out infinite alternate;
+            }
+            .resorte-skeleton-block { height: 0.9rem; margin: 0.8rem 0; }
+            .resorte-skeleton-block.title { height: 1.45rem; width: 72%; }
+            .resorte-skeleton-block.section-title { height: 1.15rem; width: 42%; margin-top: 1.5rem; }
+            .resorte-skeleton-block.short { width: 48%; }
+            .resorte-skeleton-box { box-sizing: border-box; width: 100%; padding: 1rem; }
+            .resorte-skeleton-history { height: min(560px, 62vh); }
+            .resorte-skeleton-bubble { height: 3.3rem; margin: 0.8rem 0; border-radius: 0.8rem; }
+            .resorte-skeleton-bubble.short { width: 72%; }
+            .resorte-skeleton-input { height: 2.7rem; margin-top: 0.9rem; }
+            .resorte-skeleton-upload { height: 5rem; }
+            .resorte-skeleton-preview { height: min(22rem, 38vh); margin: 0.8rem 0; }
+            .resorte-skeleton-control { height: 3rem; margin: 0.5rem 0; }
+            .resorte-skeleton-input-row {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 0.8rem;
+            }
+            .resorte-skeleton-input-row .resorte-skeleton-input { margin-top: 0; }
+            .resorte-skeleton-button { width: 11rem; height: 2.8rem; margin: 1rem 0; }
+            @keyframes resorte-pulse {
+                from { opacity: 0.42; }
+                to { opacity: 0.9; }
+            }
+            @media (max-width: 700px) {
+                .resorte-skeleton-layout { grid-template-columns: 1fr !important; gap: 1rem; }
+                .resorte-skeleton-screen { padding: 1rem; }
+                .resorte-skeleton-history { height: 10rem; }
+                .resorte-skeleton-input-row { grid-template-columns: 1fr; }
+            }
+            @media (prefers-reduced-motion: reduce) {
+                .resorte-skeleton-block,
+                .resorte-skeleton-box,
+                .resorte-skeleton-input { animation: none; opacity: 0.65; }
+            }
+            </style>
+            <div class="resorte-skeleton-screen" aria-hidden="true">
+              <div class="resorte-skeleton-layout">
+                <section class="resorte-skeleton-panel">
+                  <div class="resorte-skeleton-block title"></div>
+                  <div class="resorte-skeleton-block short"></div>
+                  <div class="resorte-skeleton-box resorte-skeleton-history">
+                    <div class="resorte-skeleton-bubble short resorte-skeleton-box"></div>
+                    <div class="resorte-skeleton-bubble resorte-skeleton-box"></div>
+                    <div class="resorte-skeleton-bubble short resorte-skeleton-box"></div>
+                  </div>
+                  <div class="resorte-skeleton-input"></div>
+                </section>
+                <section class="resorte-skeleton-panel">
+                  <div class="resorte-skeleton-block title"></div>
+                  <div class="resorte-skeleton-block short"></div>
+                  <div class="resorte-skeleton-box resorte-skeleton-upload"></div>
+                  <div class="resorte-skeleton-block section-title"></div>
+                  <div class="resorte-skeleton-block short"></div>
+                  <div class="resorte-skeleton-box resorte-skeleton-preview"></div>
+                  <div class="resorte-skeleton-box resorte-skeleton-control"></div>
+                  <div class="resorte-skeleton-block section-title"></div>
+                  <div class="resorte-skeleton-control"></div>
+                  <div class="resorte-skeleton-box resorte-skeleton-preview"></div>
+                  <div class="resorte-skeleton-block section-title"></div>
+                  <div class="resorte-skeleton-input-row">
+                    <div class="resorte-skeleton-input"></div>
+                    <div class="resorte-skeleton-input"></div>
+                    <div class="resorte-skeleton-input"></div>
+                  </div>
+                  <div class="resorte-skeleton-box resorte-skeleton-control"></div>
+                  <div class="resorte-skeleton-button resorte-skeleton-input"></div>
+                </section>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 chat_col, analizador_col = st.columns([1, 3], gap="large")
 with chat_col:
     st.subheader("Chat del análisis")
-    st.caption("Panel conversacional del experimento")
+    st.caption("Física mecánica y análisis de tus videos")
+    bienvenida_chat = (
+        "Hola. Podés preguntarme sobre física mecánica o pedirme que analice tus videos. "
+        "Para empezar, subí los videos, marcá la regla y el punto de seguimiento, "
+        "y escribí «analizar»."
+    )
     st.session_state.setdefault(
         "conversacion_analisis",
         [{
             "role": "assistant",
-            "content": (
-                "Hola. Cargá el video en el analizador y preguntame «¿qué datos faltan?». "
-                "Voy a revisar los valores actuales y señalarte qué revisar antes de correrlo."
-            ),
+            "content": bienvenida_chat,
         }],
     )
-    with st.container(height=560, border=True):
+    if st.session_state.conversacion_analisis and st.session_state.conversacion_analisis[0].get("role") == "assistant":
+        st.session_state.conversacion_analisis[0]["content"] = bienvenida_chat
+    historial_chat = st.container(height=560, border=True)
+    with historial_chat:
         for mensaje in st.session_state.conversacion_analisis:
             with st.chat_message(mensaje["role"]):
                 st.write(mensaje["content"])
@@ -103,7 +889,13 @@ with chat_col:
         st.session_state.conversacion_analisis.append(
             {"role": "user", "content": entrada_chat}
         )
-        respuesta = responder_chat_inicial(entrada_chat)
+        with historial_chat:
+            with st.chat_message("user"):
+                st.write(entrada_chat)
+            with st.chat_message("assistant"):
+                with st.spinner("Buscando respuesta…"):
+                    respuesta = responder_chat_inicial(entrada_chat)
+                st.write(respuesta)
         st.session_state.conversacion_analisis.append(
             {"role": "assistant", "content": respuesta}
         )
@@ -499,6 +1291,7 @@ with analizador_col:
     )
     sigma_masa_g = c_sigma.number_input(
         "Incerteza de masa (g)", min_value=0.0, value=0.014, step=0.001, format="%.3f",
+        key="sigma_masa_analisis_g",
         help="Incerteza de la masa colgante en gramos, según la balanza o la medición usada.",
     )
     masa_resorte_g = c_resorte.number_input(
@@ -508,6 +1301,7 @@ with analizador_col:
     )
     sigma_masa_resorte_g = c_sigma_resorte.number_input(
         "Incerteza del resorte (g)", min_value=0.0, value=0.010, step=0.001, format="%.3f",
+        key="sigma_masa_resorte_analisis_g",
         help="Incerteza de la masa del resorte en gramos, según la balanza o la medición usada.",
     )
     masa = masa_g / 1000.0
@@ -532,8 +1326,14 @@ with analizador_col:
                     key="longitud_regla",
                     help="Distancia real, en metros, entre las dos marcas que seleccionaste en el cuadro.",
                 )
+                sigma_regla_m = c_largo.number_input(
+                    "Incerteza longitud (m)", min_value=0.0, value=0.0005, step=0.0001,
+                    format="%.4f", key="sigma_longitud_regla_m",
+                    help="Incerteza de la distancia real ingresada. También podés indicarla en el chat, por ejemplo: 30 ± 0,1 cm.",
+                )
                 ventana = c_ventana.selectbox(
                     "Ventana (cuadros)", [7, 11, 21, 41], index=1,
+                    key="ventana_analisis",
                     help="Cantidad de cuadros que se usan para suavizar la posición, velocidad y aceleración. Valores grandes suavizan más, pero pueden borrar detalles.",
                 )
                 eje = c_eje.selectbox(
@@ -555,8 +1355,14 @@ with analizador_col:
                     "Longitud (m)", min_value=0.000001, value=0.300, step=0.010,
                     key="longitud_regla",
                 )
+                sigma_regla_m = c_largo.number_input(
+                    "Incerteza longitud (m)", min_value=0.0, value=0.0005, step=0.0001,
+                    format="%.4f", key="sigma_longitud_regla_m",
+                    help="Incerteza de la distancia real ingresada. También podés indicarla en el chat, por ejemplo: 30 ± 0,1 cm.",
+                )
                 ventana = c_ventana.selectbox(
                     "Ventana (cuadros)", [7, 11, 21, 41], index=1,
+                    key="ventana_analisis",
                     help="Ventana de Savitzky-Golay para filtrar posición, velocidad y aceleración.",
                 )
                 eje = c_eje.selectbox(
@@ -565,27 +1371,35 @@ with analizador_col:
                 )
         with st.expander("Chequeo estático opcional"):
             st.caption("Opcional. Solo sirve para calcular k por F = kx. NO es necesario para obtener k dinámico con el ajuste x(t).")
-            masas_texto = st.text_input("Masas estáticas (kg, separadas por comas)")
-            elongaciones_texto = st.text_input("Elongaciones (m, separadas por comas)")
-            usar_sigma_elongacion = st.checkbox("Indicar incerteza de elongación")
+            masas_texto = st.text_input(
+                "Masas estáticas (kg, separadas por comas)", key="masas_estaticas_texto"
+            )
+            elongaciones_texto = st.text_input(
+                "Elongaciones (m, separadas por comas)", key="elongaciones_estaticas_texto"
+            )
+            usar_sigma_elongacion = st.checkbox(
+                "Indicar incerteza de elongación", key="usar_sigma_elongacion"
+            )
             sigma_elongacion = st.number_input(
                 "Incerteza de cada elongación (m)",
                 min_value=0.0,
                 value=0.001,
                 step=0.001,
+                key="sigma_elongacion_m",
                 disabled=not usar_sigma_elongacion,
                 help="Incerteza de cada elongación medida, por ejemplo la resolución de la regla. Se usa para calcular la incerteza de la constante elástica estática.",
             )
 
         ejecutar = st.form_submit_button(
             "Analizando…" if st.session_state.analisis_ocupado else "Analizar videos",
-            type="primary",
+            type="secondary" if st.session_state.analisis_ocupado else "primary",
             disabled=(
                 not videos
                 or len(puntos_regla) != 2
                 or (usar_punto_tracking and (punto_tracking is None or bool(sin_punto_propio)))
                 or st.session_state.analisis_ocupado
             ),
+            key="boton_analizar_videos",
         )
 
     firma = (
@@ -601,6 +1415,7 @@ with analizador_col:
         sigma_masa_resorte,
         puntos,
         regla_m,
+        sigma_regla_m,
         ventana,
         eje,
         masas_texto,
@@ -626,7 +1441,10 @@ with analizador_col:
             try:
                 if puntos[0] == puntos[1]:
                     raise ValueError("Los dos extremos de la regla deben ser puntos distintos.")
-                escala = escala_px_por_m(puntos[0], puntos[1], regla_m)
+                escala = escala_px_por_m(
+                    puntos[0], puntos[1], regla_m,
+                    sigma_largo_m=sigma_regla_m,
+                )
                 if escala[0] <= 0:
                     raise ValueError("La escala debe ser mayor que cero.")
 
@@ -639,9 +1457,22 @@ with analizador_col:
                 ):
                     raise ValueError("El chequeo estático requiere la misma cantidad de datos y al menos 3 puntos.")
 
+                masa_origen = st.session_state.get("masa_origen_chat")
+                k_dinamica_ingresada = st.session_state.get("k_dinamica_ingresada_chat")
+                masa_inferida_chat = st.session_state.get("masa_inferida_chat_g")
+                if k_dinamica_ingresada and masa_inferida_chat:
+                    coincide_masa = np.isclose(masa_g, masa_inferida_chat[0]) and np.isclose(
+                        sigma_masa_g, masa_inferida_chat[1]
+                    )
+                    if not coincide_masa:
+                        masa_origen = "ingresada como medición"
+                        k_dinamica_ingresada = None
+
                 args = SimpleNamespace(
                     masa=masa,
                     sigma_masa=sigma_masa,
+                    masa_origen=masa_origen,
+                    k_dinamica_ingresada=k_dinamica_ingresada,
                     masa_resorte=masa_resorte,
                     sigma_masa_resorte=sigma_masa_resorte,
                     fps_led=None,
@@ -723,9 +1554,19 @@ with analizador_col:
                                     "cada video debe tener su propio punto de tracking."
                                 )
                             preanalisis = None
+                            guardado_chat = st.session_state.get("trayectorias_chat", {}).get(
+                                video_actual.file_id
+                            )
+                            if (
+                                guardado_chat
+                                and guardado_chat.get("clave")
+                                == _clave_tracking_chat(video_actual, metodo_tracking)
+                            ):
+                                preanalisis = guardado_chat.get("preanalisis")
                             vista_actual = st.session_state.get("vista_tracking")
                             if (
-                                vista_actual
+                                preanalisis is None
+                                and vista_actual
                                 and vista_actual.get("firma") == firma_videos
                                 and vista_actual.get("indice") == index
                                 and vista_actual.get("algoritmo") == algoritmo_tracking
@@ -899,3 +1740,7 @@ with analizador_col:
 
         with st.expander("Informe completo"):
             st.markdown(analisis["informe"])
+
+if not st.session_state.get("interfaz_cargada", False):
+    skeleton_interfaz.empty()
+    st.session_state["interfaz_cargada"] = True

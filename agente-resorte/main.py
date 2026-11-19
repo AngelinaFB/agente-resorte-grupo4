@@ -8,6 +8,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from importlib import metadata as importlib_metadata
+from types import SimpleNamespace
 
 import numpy as np
 import cv2
@@ -574,6 +575,37 @@ def analizar(video, a, escala, carpeta, progreso=None, punto_inicial=None,
     return analizar_desde_preanalisis(video, a, escala, carpeta, preanalisis)
 
 
+def diagnosticar_trayectoria(preanalisis, eje="auto", ventana=11):
+    """Ajusta una trayectoria en píxeles para estimar cantidades independientes de masa y escala."""
+    a = SimpleNamespace(
+        masa=1.0, sigma_masa=0.0, masa_resorte=0.0, sigma_masa_resorte=0.0,
+        masa_u=ufloat(1.0, 0.0), masa_resorte_u=ufloat(0.0, 0.0),
+        fps_led=None, fps_sigma=0.0, fps_real=None, f_led=None, corr_fps=None,
+        ventana=ventana, eje=eje, inicio=None, fin=None, recorte_auto=True,
+        ventana_inicio=0.5, umbral_inicio=0.15, residuo_max_pct=8.0,
+    )
+    with tempfile.TemporaryDirectory(prefix="resorte-diagnostico-trayectoria-") as carpeta:
+        resultado = analizar_desde_preanalisis(
+            None, a, (1.0, 0.0), carpeta, preanalisis
+        )
+    if resultado.get("estado") == "invalido":
+        return {
+            "estado": "invalido",
+            "motivo": resultado.get("motivo", "el ajuste no fue válido"),
+            "nombre": resultado.get("nombre", preanalisis.get("nombre", "video")),
+            "seguimiento": resultado.get("seguimiento", {}),
+        }
+    return {
+        "estado": resultado.get("estado", "revisar"),
+        "nombre": resultado.get("nombre", preanalisis.get("nombre", "video")),
+        "T": resultado["T"],
+        "omega": resultado["omega"],
+        "gamma": resultado["gamma"],
+        "ciclos": resultado.get("ciclos"),
+        "seguimiento": resultado.get("seguimiento", {}),
+    }
+
+
 def agregado(vals):
     """Lista de ufloat -> media, σ_est, σ_sis y σ_tot para una magnitud agregada.
 
@@ -823,6 +855,8 @@ def resultados_json(res, a=None, escala=None):
              "resorte_g": 1000.0 * resorte_kg, "sigma_resorte_g": 1000.0 * sigma_resorte_kg}
             if a is not None else None
         ),
+        "origen_masa_colgante": getattr(a, "masa_origen", None) if a is not None else None,
+        "k_dinamica_ingresada": getattr(a, "k_dinamica_ingresada", None) if a is not None else None,
         "fps": (
             {"declarado": float(res[0]["fps_decl"]), "usado": float(res[0]["fps_uso"]),
              "sigma": float(res[0]["fps_sigma"]), "origen": res[0]["fps_origen"],
@@ -893,6 +927,14 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
          f"- Umbral de residuo para Aceptable: **{getattr(a, 'residuo_max_pct', 8.0):.1f} % de la amplitud**",
          f"- Inicio del ajuste: **{inicio_txt}**",
          f"- Fin del ajuste: **{fin_txt}**", ""]
+    k_ingresada = getattr(a, "k_dinamica_ingresada", None)
+    if k_ingresada:
+        k_valor = ufloat(k_ingresada["valor"], k_ingresada["incerteza"])
+        L.insert(
+            6,
+            f"- Masa colgante inferida a partir de k dinámica ingresada: "
+            f"**{fmt(k_valor, 'N/m')}**; se usaron los ajustes válidos de las trayectorias.",
+        )
     if x_eqs:
         x_eq_global = sum(x_eqs) / len(x_eqs)
         L.append(
@@ -1032,10 +1074,36 @@ def escribir_informe(res, fallidos, a, escala, k_e, ruta):
                 L += ["", f"Se excluyeron {len(res) - len(validos)} repetición(es) por estado Revisar."]
         primer_valido = next((r for r in res if r.get("estado") != "invalido"), None)
         if primer_valido:
-            L += ["", "## Otros resultados del primer video válido", "", "### Máximos calculados", ""]
-            L.extend(f"- **{nombre}:** {fmt(valor)}" for nombre, valor in primer_valido["maximos"].items())
-            L += ["", "### Energías", "", "| Magnitud | Resultado |", "|---|---:|"]
-            L.extend(f"| {nombre} | {fmt(valor)} |" for nombre, valor in primer_valido["energia"].items())
+            maximos_nombres = list(primer_valido["maximos"])
+            energia_nombres = list(primer_valido["energia"])
+            etiquetas_estado = {
+                "aceptable": "Aceptable", "revisar": "Revisar", "invalido": "Inválido"
+            }
+            L += ["", "## Máximos por video", "",
+                  "Se muestran los resultados de cada repetición; los videos Inválidos no tienen valores de ajuste.", "",
+                  "| Video | Estado | Magnitud | Resultado |", "|---|---|---|---:|"]
+            for r in res:
+                estado = r.get("estado", "revisar")
+                etiqueta = etiquetas_estado.get(estado, estado)
+                if estado == "invalido":
+                    L.append(f"| {r['nombre']} | {etiqueta} | — | — |")
+                    continue
+                L.extend(
+                    f"| {r['nombre']} | {etiqueta} | {nombre} | {fmt(r['maximos'][nombre])} |"
+                    for nombre in maximos_nombres
+                )
+            L += ["", "## Energías por video", "",
+                  "| Video | Estado | Magnitud | Resultado |", "|---|---|---|---:|"]
+            for r in res:
+                estado = r.get("estado", "revisar")
+                etiqueta = etiquetas_estado.get(estado, estado)
+                if estado == "invalido":
+                    L.append(f"| {r['nombre']} | {etiqueta} | — | — |")
+                    continue
+                L.extend(
+                    f"| {r['nombre']} | {etiqueta} | {nombre} | {fmt(r['energia'][nombre])} |"
+                    for nombre in energia_nombres
+                )
             diagnosticos = [r for r in res if r.get("energia_borde")]
             if diagnosticos:
                 def _pct(valor):

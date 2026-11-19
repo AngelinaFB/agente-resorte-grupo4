@@ -1,11 +1,26 @@
 # Reporte de estado 6
 
-**Fecha:** 13 de noviembre de 2026  
+**Fecha:** 19 de noviembre de 2026
 **Proyecto:** Analizador de video de un resorte
+
+## Actualización del 18 de noviembre
+
+- El chat de Streamlit usa el backend bibliográfico existente. Las consultas conceptuales buscan evidencia en el índice local y muestran citas con documento y página; el backend se abstiene si no encuentra evidencia confiable.
+- El chat responde preguntas reconocidas sobre los resultados de la corrida vigente leyendo su JSON: período, frecuencia, amortiguamiento, k, amplitud, máximos, energías y seguimiento. Comprueba que los parámetros visibles coincidan con los del análisis. No es un asistente abierto que interprete cualquier pregunta.
+- Al enviar un mensaje, este aparece de inmediato en el historial y el asistente muestra un spinner simple con «Buscando respuesta…», sin panel expandible. Se cambió el saludo para presentar física mecánica y análisis de videos, sin mencionar la bibliografía.
+- Al abrir la interfaz, una skeleton screen cubre temporalmente la página con sectores separados para chat y analizador, en la proporción de columnas real. El panel del analizador ahora reserva bloques para carga, calibración, seguimiento y datos físicos, en lugar de un único bloque genérico.
+- El flujo conversacional acepta incertidumbre para la longitud de calibración. Si no se conoce la masa del resorte, puede continuar suponiéndola cero y lo informa como aproximación.
+- Se revisó el control de calidad bibliográfico: las páginas marcadas como OCR/calidad no se aceptan como evidencia. No se modificaron PDF ni se aplicó OCR; instalar Tesseract no fue autorizado.
+- Se eliminó `TAREAS_PENDIENTES.md`; el seguimiento de hoy queda en este reporte.
+- `setup-chatbot.ps1` prepara dependencias, Ollama, BGE-M3, el índice de PDF y sus embeddings en la computadora local. No descarga Qwen2.5:7b; si falta ese modelo, las respuestas pueden limitarse a citas textuales verificadas.
+
+## Actualización del 19 de noviembre
+
+- Durante el análisis, el mismo botón cambia a «Analizando…», queda deshabilitado y pasa al estilo secundario; se usa una clave estable para evitar duplicarlo junto al botón rojo original.
 
 ## Estado actual
 
-La interfaz conserva el analizador completo en un panel y muestra el chat al lado. El chat mantiene el historial en un panel con desplazamiento propio. Por ahora responde de forma guiada con el estado de los datos ingresados; todavía no es un asistente de física conectado a un modelo o a la bibliografía.
+La interfaz conserva el analizador completo en un panel y muestra el chat al lado. El chat tiene historial con desplazamiento propio, un indicador de espera y rutas diferenciadas para preguntas bibliográficas y consultas sobre resultados de la corrida actual.
 
 La calibración espacial permite marcar con el mouse dos extremos de una distancia conocida en el primer cuadro. El tercer clic reinicia la selección. El selector de la regla y el del punto de seguimiento tienen un control de icono para ampliar la imagen al ancho disponible.
 
@@ -19,15 +34,13 @@ La sugerencia anterior de instalar numdifftools para resolver la covarianza fue 
 
 Se restauró el códec avc1 para la vista previa del seguimiento, como estaba antes del intento con mp4v, porque el usuario prefiere conservar el video aunque OpenCV deje un aviso de OpenH264 en la consola.
 
-## Pendiente
+## Pendiente: pruebas
 
-
-
-- Analizar la trayectoria para determinar las entradas que realmente faltan en cada cálculo y pedirlas por chat.
-- Aplicar las respuestas a los cálculos y producir el informe completo de cinemática, dinámica y energías.
-- Conectar consultas de física con la bibliografía de la cátedra y mostrar citas.
-- Validar visualmente la interfaz y el flujo completo con videos de referencia; actualizar la guía de instalación.
+- Comprobar visualmente el skeleton screen al abrir la app y al refrescar con F5.
+- Probar preguntas de mecánica respaldadas por bibliografía, ambiguas y sin evidencia suficiente.
+- Probar preguntas sobre resultados con una corrida vigente y después de cambiar parámetros o videos.
+- Probar el flujo completo con videos de referencia: carga, calibración, tracking, FPS, chat e informe.
 
 ## Verificación de estos cambios
 
-La sintaxis de app.py y main.py se verificó con ast.parse; pip check no reporta conflictos y git diff --check no detecta errores de whitespace. No se ejecutó el análisis con el video R1 P3 ni pruebas automatizadas.
+La sintaxis de `app.py` se verificó con `ast.parse` y `git diff --check` no detectó errores de whitespace. No se probó la interfaz completa con consultas reales ni se ejecutó un análisis de video después de los cambios recientes.

@@ -12,7 +12,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\setup-chatbot.ps1
 ```
 
-El script de preparacion configura dependencias y el modelo de embeddings de Etapa 3A. Ollama y modelos se almacenan fuera del repo. La busqueda bibliografica no esta integrada en Streamlit.
+El script de preparacion configura dependencias y el modelo de embeddings de Etapa 3A. Ollama y modelos se almacenan fuera del repo. El chat de Streamlit usa la misma funcion de consulta bibliografica (`answer_question`) que el comando local `ask`.
 
 Para reconstruir los indices locales despues de cambiar los PDF:
 
@@ -47,7 +47,7 @@ El comando `ask` recupera fragmentos mediante la busqueda hibrida, aplica reglas
 .\.venv\Scripts\python.exe -m chatbot.cli ask "Que es la energia mecanica?" --limit 8 --json
 ```
 
-La salida JSON incluye candidatos recuperados, fragmentos aceptados y descartados con motivos, afirmaciones verificadas y rechazadas, referencias y tiempos de recuperacion/generacion/validacion. `ask` no se integra a Streamlit.
+La salida JSON incluye candidatos recuperados, fragmentos aceptados y descartados con motivos, afirmaciones verificadas y rechazadas, referencias y tiempos de recuperacion/generacion/validacion. El comando `ask` sigue disponible para consultas desde la terminal; la app presenta en el panel de chat solo la respuesta verificada y sus fuentes.
 
 Para repetir la evaluacion local de las cuatro consultas de 3C:
 
