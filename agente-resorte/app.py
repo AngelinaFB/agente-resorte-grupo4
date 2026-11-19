@@ -237,41 +237,31 @@ def _resumen_ajuste_chat(diagnosticos):
     lineas = []
     for dato in diagnosticos:
         if dato.get("estado") == "invalido":
-            lineas.append(f"{dato['nombre']}: no se pudo ajustar ({dato.get('motivo', 'ajuste inválido')})")
+            motivo = str(dato.get("motivo", "")).lower()
+            detalle = "covarianza singular" if "covarianza" in motivo else "ajuste no confiable"
+            lineas.append(f"- **{dato['nombre']}:** {detalle}.")
             continue
         T, omega, gamma = dato["T"], dato["omega"], dato["gamma"]
         lineas.append(
-            f"{dato['nombre']}: T = {T.n:.4g} ± {T.s:.2g} s; "
-            f"ω = {omega.n:.4g} ± {omega.s:.2g} rad/s; "
-            f"γ = {gamma.n:.4g} ± {gamma.s:.2g} 1/s ({dato['estado']})"
+            f"- **{dato['nombre']}:** $T={T.n:.4g}\\pm{T.s:.2g}\\,\\mathrm{{s}}$; "
+            f"$\\gamma={gamma.n:.4g}\\pm{gamma.s:.2g}\\,\\mathrm{{s}}^{{-1}}$."
         )
     return "\n".join(lineas)
 
 
 def _explicar_datos_derivables(vista, diagnosticos=()):
-    texto = (
-        "Con la trayectoria del video, la calibración espacial y el tiempo de cuadro se obtienen "
-        "posición, velocidad y aceleración; el ajuste oscilatorio permite estimar amplitud, "
-        "período y amortiguamiento. Para convertir píxeles a metros hace falta la longitud real de la regla. "
-        "La constante elástica y las energías absolutas requieren además las masas: "
-        "k se calcula con la masa efectiva (masa colgante + un tercio de la masa del resorte) "
-        "y la frecuencia del ajuste."
-    )
+    lineas = [
+        "**Del video obtengo:** posición, velocidad, aceleración, amplitud, período y amortiguamiento."
+    ]
     if diagnosticos:
-        texto += " Ajuste de las trayectorias guardadas:\n" + _resumen_ajuste_chat(diagnosticos)
+        lineas.append("**Ajuste preliminar:**\n" + _resumen_ajuste_chat(diagnosticos))
     elif vista:
         resumen = vista.get("resumen", {})
         detectados = resumen.get("detectados")
         cuadros = resumen.get("cuadros")
-        perdidos = resumen.get("perdidos")
         if detectados is not None and cuadros:
-            texto += f" La vista de seguimiento actual detectó {detectados} de {cuadros} cuadros"
-            if perdidos is not None:
-                texto += f" y perdió {perdidos}"
-            texto += "."
-    else:
-        texto += " Todavía no hay una trayectoria guardada; al iniciar el análisis se extraerá una sola vez."
-    return texto
+            lineas.append(f"**Seguimiento:** {detectados}/{cuadros} cuadros detectados.")
+    return "\n\n".join(lineas)
 
 
 def _normalizar_texto_chat(texto):
@@ -302,6 +292,57 @@ def _es_pregunta_bibliografica(mensaje):
     texto = _normalizar_texto_chat(mensaje).strip()
     return "?" in mensaje or texto.startswith(
         ("que ", "como ", "por que ", "cual ", "cuando ", "explicame ", "defini ")
+    )
+
+
+def _es_consulta_fisica_chat(mensaje):
+    palabras = re.findall(r"[a-z0-9]+", _normalizar_texto_chat(mensaje))
+    temas = (
+        "fisic", "mecanic", "resort", "muell", "oscil", "movim", "cinematic",
+        "dinamic", "fuerz", "masa", "peso", "gravedad", "gravit", "newton",
+        "hooke", "rozamiento", "friccion", "equilibr", "inerc", "impuls",
+        "choque", "colision", "trayector", "desplaz", "posicion", "veloc",
+        "aceler", "rapidez", "amplitud", "period", "frecuenc", "amortigu",
+        "energi", "trabaj", "potenci", "elast", "derivad", "integral",
+        "conservacion", "caida", "rotacion", "torque", "momento",
+    )
+    return any(palabra.startswith(tema) for palabra in palabras for tema in temas) or bool(
+        re.search(r"(?<!\w)k(?!\w)", _normalizar_texto_chat(mensaje))
+    )
+
+
+def _respuesta_social_chat(mensaje):
+    texto = _normalizar_texto_chat(mensaje).strip(" .,!¿?¡")
+    saludos = {
+        "hola", "holi", "buenas", "buen dia", "buenos dias", "buenas tardes",
+        "buenas noches", "hey", "que tal", "como estas",
+    }
+    cortesias = {"gracias", "muchas gracias", "ok", "dale", "listo", "genial"}
+    if texto in saludos:
+        return "¡Hola! Soy un asistente de **física mecánica** y análisis de videos de resortes. ¿Qué necesitás?"
+    if texto in cortesias:
+        return "¡De nada! Puedo ayudarte con **física mecánica** o con el análisis de tus videos."
+    return None
+
+
+def _es_respuesta_dato_chat(mensaje, paso):
+    if paso == "regla":
+        return _leer_longitud_chat(mensaje) is not None
+    if paso == "k":
+        return _leer_constante_chat(mensaje) is not None
+    if paso in ("masa", "masa_resorte", "masa_resorte_k"):
+        texto = _normalizar_texto_chat(mensaje).strip(" .,!¿?")
+        return _leer_medida_chat(mensaje) is not None or texto in {
+            "no la se", "la desconozco", "desconozco", "no tengo ese dato",
+            "masa despreciable", "aproximar como despreciable",
+        }
+    return False
+
+
+def _mensaje_fuera_de_alcance():
+    return (
+        "Puedo ayudar con **física mecánica** y el **análisis de videos de resortes**. "
+        "Preguntame sobre movimiento, fuerzas, energía o tus resultados."
     )
 
 
@@ -590,9 +631,18 @@ def responder_chat_inicial(mensaje):
             st.session_state["paso_datos_chat"] = None
 
     paso = st.session_state.get("paso_datos_chat")
+    respuesta_social = _respuesta_social_chat(mensaje)
+    if respuesta_social:
+        return respuesta_social
     if paso and any(palabra in texto for palabra in ("cancel", "después", "despues")):
         st.session_state["paso_datos_chat"] = None
         return "Dejé el análisis en pausa. Cuando quieras continuar, escribí «analizar»."
+    if (
+        paso
+        and not _es_consulta_fisica_chat(mensaje)
+        and not _es_respuesta_dato_chat(mensaje, paso)
+    ):
+        return _mensaje_fuera_de_alcance()
     if _es_consulta_resultado_chat(mensaje):
         analisis_actual = _analisis_vigente_chat(videos_actuales)
         if analisis_actual is None:
@@ -604,7 +654,9 @@ def responder_chat_inicial(mensaje):
         return responder_chat_resultados(mensaje, analisis_actual)
 
     if paso and _es_pregunta_bibliografica(mensaje):
-        return responder_chat_bibliografia(mensaje)
+        if _es_consulta_fisica_chat(mensaje):
+            return responder_chat_bibliografia(mensaje)
+        return _mensaje_fuera_de_alcance()
 
     if paso == "regla":
         medida_longitud = _leer_longitud_chat(mensaje)
@@ -624,31 +676,36 @@ def responder_chat_inicial(mensaje):
             return "Anoté la longitud actualizada. Voy a regenerar el informe con la trayectoria guardada, sin volver a seguir el video."
         st.session_state["paso_datos_chat"] = "fuente_dinamica"
         ajuste = _resumen_ajuste_chat(st.session_state.get("diagnosticos_chat", []))
-        detalle_incerteza = (
-            f" Usaré una incertidumbre de longitud de {sigma_longitud_m:g} m."
-            if sigma_longitud_m is not None
-            else " Como no indicaste incertidumbre para la longitud, usaré la configurada en el analizador."
+        incertidumbre = (
+            f" (± {sigma_longitud_m:g} m)" if sigma_longitud_m is not None else ""
         )
-        return "Anoté la longitud." + detalle_incerteza + " Del ajuste de la trayectoria ya obtuve:\n" + ajuste + "\nPara completar dinámica y energías, elegí qué dato conocés: respondé «masa» si mediste la masa colgante, o «k» si tenés una constante elástica medida independientemente (por ejemplo, con un ensayo estático). Con k y la frecuencia del video puedo estimar la masa faltante."
+        respuesta = f"Anoté **ℓ = {longitud_m:g} m{incertidumbre}**."
+        if ajuste:
+            respuesta += f"\n\n**Ajuste preliminar:**\n{ajuste}"
+        respuesta += (
+            "\n\n**Dato que falta:** masa colgante o una k medida independientemente. "
+            "Respondé **masa** o **k**."
+        )
+        return respuesta
 
     if paso == "fuente_dinamica":
         if "masa" in texto and "resorte" not in texto:
             st.session_state["modo_datos_dinamica_chat"] = "masa"
             st.session_state["paso_datos_chat"] = "masa"
-            return "Indicá la masa colgante medida en g o kg. Podés incluir la incertidumbre, por ejemplo: 64,5 ± 0,1 g."
+            return "Indicá la masa colgante en g o kg; podés agregar su incertidumbre. Ej.: **64,5 ± 0,1 g**."
         if re.search(r"\bk\b", texto) or "constante" in texto or "elastica" in texto or "elástica" in texto:
             st.session_state["modo_datos_dinamica_chat"] = "k"
             st.session_state["paso_datos_chat"] = "k"
-            return "Indicá la constante elástica medida en N/m junto con su incertidumbre, por ejemplo: k = 12,4 ± 0,3 N/m."
-        return "Elegí una alternativa: escribí «masa» para ingresar la masa colgante o «k» para ingresar una constante elástica medida."
+            return "Indicá la constante medida en N/m con su incertidumbre. Ej.: **k = 12,4 ± 0,3 N/m**."
+        return "Respondé **masa** o **k**, según el dato que tengas."
 
     if paso == "k":
         constante = _leer_constante_chat(mensaje)
         if constante is None or constante[0] <= 0 or constante[1] < 0:
-            return "No pude leer k y su incertidumbre. Usá el formato k = 12,4 ± 0,3 N/m."
+            return "No pude leer k. Usá el formato **k = 12,4 ± 0,3 N/m**."
         st.session_state["k_dinamica_chat"] = constante
         st.session_state["paso_datos_chat"] = "masa_resorte_k"
-        return "Anoté k. Para despejar la masa colgante también necesito la masa del resorte; indicá el valor en g o kg y, si la tenés, su incertidumbre. Si no la conocés, respondé «desconozco» y usaré masa del resorte cero como aproximación."
+        return "Anoté **k**. Indicá la masa del resorte en g o kg; si no la conocés, respondé **desconozco** y la aproximaré a cero."
 
     if paso in ("masa", "masa_resorte", "masa_resorte_k"):
         texto_normalizado = _normalizar_texto_chat(mensaje).strip(" .,!¿?")
@@ -666,14 +723,14 @@ def responder_chat_inicial(mensaje):
             or (medida[1] is not None and medida[1] < 0)
         ):
             nombre = "masa colgante" if paso == "masa" else "masa del resorte"
-            return f"No pude leer ese valor. Indicá la {nombre} en g o kg; podés agregar ± y la incertidumbre."
+            return f"No pude leerlo. Indicá la **{nombre}** en g o kg (ej.: **9,7 ± 0,1 g**)."
         valor_g, sigma_g = medida
         if paso == "masa":
             st.session_state["masa_analisis_g"] = valor_g
             if sigma_g is not None:
                 st.session_state["sigma_masa_analisis_g"] = sigma_g
             st.session_state["paso_datos_chat"] = "masa_resorte"
-            return "Anoté la masa colgante. ¿Cuánto pesa el resorte? Respondé en g o kg y podés agregar su incertidumbre con ±. Si no la conocés, respondé «desconozco» y usaré masa del resorte cero como aproximación."
+            return "Anoté la masa colgante. ¿Cuánto pesa el resorte? Podés responder **desconozco** si querés aproximarlo a cero."
 
         st.session_state["masa_resorte_analisis_g"] = valor_g
         if sigma_g is not None:
@@ -715,19 +772,21 @@ def responder_chat_inicial(mensaje):
         st.session_state["analisis_ocupado"] = True
         if omitir_masa_resorte:
             resultado_masa += (
-                "Como no se conoce la masa del resorte, la tomé como cero; esto es una aproximación "
-                "y afecta la masa efectiva, k y las energías. "
+                "Tomé la masa del resorte como cero (aproximación). "
             )
-        return resultado_masa + "Ya tengo los datos. Voy a generar el informe reutilizando las trayectorias guardadas."
+        return resultado_masa + "Listo, genero el informe con las trayectorias guardadas."
 
     if not _es_pedido_analisis(mensaje):
-        return responder_chat_bibliografia(mensaje)
+        if _es_consulta_fisica_chat(mensaje):
+            return responder_chat_bibliografia(mensaje)
+        return _mensaje_fuera_de_alcance()
 
     pendientes = _estado_preparacion_chat(videos_actuales)
     vista_tracking = _vista_tracking_actual(videos_actuales)
     if pendientes:
         explicacion = _explicar_datos_derivables(vista_tracking)
-        return explicacion + " Para empezar, " + "; además, ".join(pendientes) + ". Cuando esté listo, escribí «analizar» aquí."
+        faltantes = "\n".join(f"- {pendiente.capitalize()}" for pendiente in pendientes)
+        return f"{explicacion}\n\n**Antes de seguir:**\n{faltantes}\nDespués, escribí **analizar**."
 
     diagnosticos, errores_tracking = _obtener_diagnosticos_chat(videos_actuales)
     if errores_tracking:
@@ -736,11 +795,19 @@ def responder_chat_inicial(mensaje):
 
     if not st.session_state.get("longitud_confirmada_chat"):
         st.session_state["paso_datos_chat"] = "regla"
-        return explicacion + " ¿Qué longitud real hay entre los dos puntos marcados de la regla? Respondé en m o cm, por ejemplo: 30 cm."
+        return (
+            explicacion
+            + "\n\n**Me falta la longitud real de la regla.** ¿Cuánto mide entre las marcas? "
+            "Ej.: **30 cm**."
+        )
 
     if not st.session_state.get("masas_confirmadas_chat"):
         st.session_state["paso_datos_chat"] = "fuente_dinamica"
-        return explicacion + " Para completar dinámica y energías, podés ingresar la masa colgante o una k medida independientemente (con incertidumbre); con k y el ajuste del video se puede inferir la masa. ¿Cuál de esos datos tenés?"
+        return (
+            explicacion
+            + "\n\n**Para calcular dinámica y energía**, necesito la masa colgante "
+            "o una k medida. ¿Cuál tenés: **masa** o **k**?"
+        )
 
     st.session_state["analisis_ocupado"] = True
     return "Los datos requeridos están cargados. Voy a generar el informe; cada video se seguirá una sola vez y se reutilizará cualquier trayectoria ya guardada."
@@ -882,7 +949,7 @@ with chat_col:
                 st.write(mensaje["content"])
 
     entrada_chat = st.chat_input(
-        "Escribí sobre este análisis…",
+        "Escribí tu mensaje",
         key="entrada_chat_analisis",
     )
     if entrada_chat:
@@ -918,6 +985,8 @@ with analizador_col:
         div[data-testid="stNumberInput"] { max-width: 170px !important; }
         div[data-testid="stSelectbox"] { max-width: 230px !important; }
         div[data-testid="stTextInput"] { max-width: 320px !important; }
+        /* Elimina el espacio muerto donde se perdia el foco del textarea. */
+        .st-key-entrada_chat_analisis div:has(> div > textarea) { column-gap: 0; }
         </style>
         """,
         unsafe_allow_html=True,

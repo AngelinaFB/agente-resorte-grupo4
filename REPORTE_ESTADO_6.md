@@ -17,6 +17,8 @@
 ## Actualización del 19 de noviembre
 
 - Durante el análisis, el mismo botón cambia a «Analizando…», queda deshabilitado y pasa al estilo secundario; se usa una clave estable para evitar duplicarlo junto al botón rojo original.
+- El chat responde saludos y mensajes fuera de física con una aclaración breve de su alcance, sin consultar embeddings ni Ollama. Se acortaron y formatearon con Markdown los mensajes del flujo para pedir datos.
+- Se simplificó el placeholder del chat a «Escribí tu mensaje», sin puntos suspensivos.
 
 ## Estado actual
 
